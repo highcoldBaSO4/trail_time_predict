@@ -7,6 +7,7 @@ from typing import Callable
 from analysis.capability import build_runner_profile, save_runner_profile
 from parser.fit_reader import read_fit_directory
 from parser.gpx_reader import build_race_segments, read_gpx, save_segments
+from analysis.data_quality import diagnose_gpx
 from predictor.race_predictor import format_duration, predict_race, save_prediction
 from predictor.report import build_markdown_report, save_markdown_report
 
@@ -30,6 +31,8 @@ def run_pipeline(
 
     _emit(progress, "[3/5] 正在解析比赛 GPX 并生成路线分段……")
     points = read_gpx(race_gpx)
+    gpx_quality = diagnose_gpx(points)
+    _emit(progress, f"    GPX 数据质量：{gpx_quality['level']}（{float(gpx_quality['score']):.0%}）")
     _emit(progress, f"    GPX 读取完成，共 {len(points):,} 个轨迹点；正在按 {segment_distance_m:g} 米分段……")
     segments = build_race_segments(points, segment_distance_m)
     _emit(progress, f"    路线分段完成，共 {len(segments):,} 段")
@@ -37,6 +40,7 @@ def run_pipeline(
 
     _emit(progress, f"[4/5] 正在预测 {len(segments)} 个路线分段……")
     prediction = predict_race(profile, segments, aid_minutes)
+    prediction["gpx_data_quality"] = gpx_quality
     save_prediction(prediction, output / "prediction.json")
     _emit(progress, "[5/5] 正在生成报告和海拔图……")
     save_markdown_report(build_markdown_report(profile, prediction), output / "report.md")

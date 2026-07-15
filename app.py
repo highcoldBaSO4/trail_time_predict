@@ -185,23 +185,25 @@ def ability_table(profile: dict[str, Any], direction: str) -> pd.DataFrame:
                   ("中坡", "10%～15%", "10_percent"), ("陡坡", "≥15%", "15_percent"))
         ability = profile["uphill"]
         rows = []
-        for name, grade, key in labels:
+        for index, (name, grade, key) in enumerate(labels):
             sample = ability.get("_samples", {}).get(key, {})
+            point = ability.get("curve", [{}] * 4)[index]
             pace = _sample_pace(sample)
-            rows.append([name, grade, pace, f"{float(ability[key]):.0f} m/h", int(sample.get("segments", 0)),
+            rows.append([name, grade, pace, f"{float(ability[key]):.0f} m/h", f"{float(point.get('confidence', .2)):.0%}", int(sample.get("segments", 0)),
                          f"{float(sample.get('distance_km', 0)):.2f} km", f"+{float(sample.get('vertical_m', 0)):.0f} m"])
     else:
         labels = (("微下降", "-1%～-5%", "-1_percent"), ("缓下降", "-5%～-10%", "-5_percent"),
                   ("中下降", "-10%～-15%", "-10_percent"), ("陡下降", "≤-15%", "-15_percent"))
         ability = profile["downhill"]
         rows = []
-        for name, grade, key in labels:
+        for index, (name, grade, key) in enumerate(labels):
             sample = ability.get("_samples", {}).get(key, {})
+            point = ability.get("curve", [{}] * 4)[index]
             pace = _sample_pace(sample, float(ability[key]["speed_mps"]))
-            rows.append([name, grade, pace, f"-{float(ability[key]['vertical_speed_mph']):.0f} m/h",
+            rows.append([name, grade, pace, f"-{float(ability[key]['vertical_speed_mph']):.0f} m/h", f"{float(point.get('confidence', .2)):.0%}",
                          int(sample.get("segments", 0)), f"{float(sample.get('distance_km', 0)):.2f} km",
                          f"-{float(sample.get('vertical_m', 0)):.0f} m"])
-    return pd.DataFrame(rows, columns=["档位", "平均坡度", "等效配速", "VAM", "样本", "累计距离", "累计高度"])
+    return pd.DataFrame(rows, columns=["档位", "平均坡度", "等效配速", "VAM", "可信度", "样本", "累计距离", "累计高度"])
 
 
 def _sample_pace(sample: dict[str, Any], fallback_speed: float | None = None) -> str:
@@ -282,10 +284,11 @@ def render_result(result: dict[str, Any]) -> None:
 
     with ability_tab:
         flat = profile["flat"]
-        flat1, flat2, flat3 = st.columns(3)
+        flat1, flat2, flat3, flat4 = st.columns(4)
         flat1.metric("越野平路综合配速", f"{format_pace(float(flat['aerobic_pace']))}/km")
         flat2.metric("较快配速（P25）", f"{format_pace(float(flat['threshold_pace']))}/km")
         flat3.metric("自然平路样本", f"{int(flat.get('qualified_segments', 0))} 段")
+        flat4.metric("平路可信度", f"{float(flat.get('confidence', .2)):.0%}")
         st.subheader("上坡能力")
         st.dataframe(ability_table(profile, "uphill"), hide_index=True, width="stretch")
         st.subheader("下坡能力")
@@ -304,6 +307,15 @@ def render_result(result: dict[str, Any]) -> None:
             width="stretch",
         )
         st.caption("预测按“分段基础耗时 ÷ 能力保留比例”应用疲劳修正。")
+        st.subheader("地形归一化连续疲劳曲线")
+        curve_rows = []
+        for terrain, label in (("flat", "平路"), ("uphill", "上坡"), ("downhill", "下坡")):
+            for point in fatigue.get(terrain, []):
+                confidence = "—（固定基准）" if point.get("source") == "anchor" else f"{float(point.get('confidence', .2)):.0%}"
+                curve_rows.append([label, f"{float(point['hour']):g}h", f"{float(point['factor']):.0%}", confidence])
+        st.dataframe(pd.DataFrame(curve_rows, columns=["地形", "时间", "能力保留", "可信度"]), hide_index=True, width="stretch")
+        quality = profile.get("data_quality", {})
+        st.caption(f"数据质量综合评分：{float(quality.get('score', .2)):.0%}；建议用于建模 {int(quality.get('recommended_count', 0))}/{int(profile.get('sample_count', 0))} 个活动。")
 
     with segment_tab:
         segment_frame = pd.DataFrame(prediction["segments"])

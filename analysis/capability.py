@@ -1,26 +1,26 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from analysis.activity_analysis import add_interval_metrics, analyze_activity
+from analysis.confidence import aggregate_quality_score, calculate_confidence
+from analysis.data_quality import diagnose_fit
 from analysis.fatigue import build_fatigue_profile
+from config import load_config
 from parser.gpx_reader import group_terrain_chunks
 
 
+_CONFIG_DEFAULTS = load_config()["default_profile"]
 DEFAULT_PROFILE = {
-    "flat": {"aerobic_pace": 420.0, "threshold_pace": 360.0},
-    "uphill": {"1_percent": 300.0, "5_percent": 550.0, "10_percent": 500.0, "15_percent": 400.0},
-    "downhill": {
-        "-1_percent": {"speed_mps": 2.8, "vertical_speed_mph": 400.0},
-        "-5_percent": {"speed_mps": 2.5, "vertical_speed_mph": 900.0},
-        "-10_percent": {"speed_mps": 2.2, "vertical_speed_mph": 1100.0},
-        "-15_percent": {"speed_mps": 1.8, "vertical_speed_mph": 1250.0},
-    },
-    "fatigue": {"3h": 1.0, "5h": 0.90, "8h": 0.80},
+    "flat": _CONFIG_DEFAULTS["flat"],
+    "uphill": dict(zip(("1_percent", "5_percent", "10_percent", "15_percent"), (p["value"] for p in _CONFIG_DEFAULTS["uphill"]))),
+    "downhill": dict(zip(("-1_percent", "-5_percent", "-10_percent", "-15_percent"),
+                            ({"speed_mps": p["speed_mps"], "vertical_speed_mph": p["vertical_speed_mph"]} for p in _CONFIG_DEFAULTS["downhill"]))),
 }
 
 
@@ -31,25 +31,32 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
     enriched: list[pd.DataFrame] = []
     terrain_segments: list[dict[str, float | str]] = []
     activity_types: dict[str, str] = {}
+    quality_reports: dict[str, dict[str, object]] = {}
     for name, frame in activities.items():
         activity_type = _activity_type(name, frame)
         activity_types[name] = activity_type
+        quality_reports[name] = diagnose_fit(frame)
         activity = add_interval_metrics(frame)
         activity["_activity_name"] = name
         activity["_activity_type"] = activity_type
+        activity["_model_weight"] = _activity_weight(name, activity)
         enriched.append(activity)
         terrain_segments.extend(_activity_terrain_segments(activity, name, activity_type))
     segment_frame = pd.DataFrame(terrain_segments)
-    flat = _build_flat_profile(segment_frame)
+    quality_score = aggregate_quality_score(list(quality_reports.values()))
+    flat = _build_flat_profile(segment_frame, quality_score)
     uphill = {**DEFAULT_PROFILE["uphill"], **_build_uphill_profile(segment_frame)}
     downhill = {**DEFAULT_PROFILE["downhill"], **_build_downhill_profile(segment_frame)}
+    uphill["curve"] = _uphill_curve(uphill, quality_score)
+    downhill["curve"] = _downhill_curve(downhill, quality_score)
     activity_summaries = []
     for name, frame in activities.items():
         summary = analyze_activity(frame, name)
         summary["activity_type"] = activity_types[name]
+        summary["data_quality"] = quality_reports[name]
         activity_summaries.append(summary)
     profile: dict[str, object] = {
-        "schema_version": "0.1",
+        "schema_version": "0.2-phase1",
         "units": {
             "flat_pace": "seconds_per_km",
             "uphill": "vertical_metres_per_hour",
@@ -68,6 +75,11 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
             "flat": sum(item["type"] == "flat" for item in terrain_segments),
         },
         "sample_count": len(activities),
+        "data_quality": {
+            "score": round(quality_score, 3),
+            "activities": quality_reports,
+            "recommended_count": sum(bool(report["recommended_for_model"]) for report in quality_reports.values()),
+        },
     }
     return profile
 
@@ -78,7 +90,7 @@ def save_runner_profile(profile: dict[str, object], path: str | Path) -> None:
     target.write_text(json.dumps(profile, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _build_flat_profile(segments: pd.DataFrame) -> dict[str, object]:
+def _build_flat_profile(segments: pd.DataFrame, quality_score: float = 1.0) -> dict[str, object]:
     """Blend trail flats with discounted road flats; heart rate is not used."""
     if segments.empty:
         flat_segments = segments
@@ -96,16 +108,17 @@ def _build_flat_profile(segments: pd.DataFrame) -> dict[str, object]:
             "source": "default_no_qualified_segment",
             "qualified_segments": 0,
             "sample_distance_km": 0.0,
+            "confidence": calculate_confidence(0, 0, source="default"),
         }
 
     trail = flat_segments[flat_segments["activity_type"] == "trail"]
     road = flat_segments[flat_segments["activity_type"] == "road"]
     road_penalty = 1.10
     trail_weight, road_weight = 0.70, 0.30
-    trail_pace = _percentile_or_nan(trail["pace"], 50)
-    trail_fast = _percentile_or_nan(trail["pace"], 25)
-    road_pace = _percentile_or_nan(road["pace"], 50)
-    road_fast = _percentile_or_nan(road["pace"], 25)
+    trail_pace = _weighted_percentile(trail, "pace", 50)
+    trail_fast = _weighted_percentile(trail, "pace", 30)
+    road_pace = _weighted_percentile(road, "pace", 50)
+    road_fast = _weighted_percentile(road, "pace", 30)
     if np.isfinite(trail_pace) and np.isfinite(road_pace):
         baseline = trail_weight * trail_pace + road_weight * road_pace * road_penalty
         faster = trail_weight * trail_fast + road_weight * road_fast * road_penalty
@@ -114,6 +127,8 @@ def _build_flat_profile(segments: pd.DataFrame) -> dict[str, object]:
         baseline, faster, source = trail_pace, trail_fast, "trail_only"
     else:
         baseline, faster, source = road_pace * road_penalty, road_fast * road_penalty, "discounted_road_only"
+    duration_seconds = float(flat_segments["duration_s"].sum())
+    variability = float(flat_segments["pace"].std() / flat_segments["pace"].mean()) if len(flat_segments) > 1 else None
     return {
         "aerobic_pace": round(float(baseline), 1),
         "threshold_pace": round(float(faster), 1),
@@ -125,6 +140,8 @@ def _build_flat_profile(segments: pd.DataFrame) -> dict[str, object]:
         "road": _flat_source_summary(road),
         "weights": {"trail": trail_weight, "road": road_weight},
         "road_to_trail_pace_factor": road_penalty,
+        "sample_duration_seconds": round(duration_seconds, 1),
+        "confidence": calculate_confidence(duration_seconds, len(flat_segments), quality_score, variability),
     }
 
 
@@ -192,6 +209,7 @@ def _activity_terrain_segments(
                     "grade_pct": grade,
                     "pace": duration / segment_distance * 1000.0,
                     "speed_mps": segment_distance / duration,
+                    "model_weight": float(block["_model_weight"].iloc[0]),
                 }
             )
     return segments
@@ -261,6 +279,33 @@ def _percentile_or_nan(series: pd.Series, percentile: float) -> float:
     return float(np.percentile(series.to_numpy(dtype=float), percentile)) if len(series) else np.nan
 
 
+def _weighted_percentile(frame: pd.DataFrame, column: str, percentile: float) -> float:
+    if frame.empty:
+        return np.nan
+    values = frame[column].to_numpy(dtype=float)
+    weights = frame.get("model_weight", pd.Series(1.0, index=frame.index)).to_numpy(dtype=float)
+    order = np.argsort(values)
+    values, weights = values[order], weights[order]
+    target = np.clip(percentile / 100.0, 0.0, 1.0) * weights.sum()
+    index = min(int(np.searchsorted(np.cumsum(weights), target, side="left")), len(values) - 1)
+    return float(values[index])
+
+
+def _activity_weight(name: str, frame: pd.DataFrame) -> float:
+    """Combine configured activity recency and purpose weights."""
+    config = load_config()
+    valid_time = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True).dropna()
+    age_days = max(0, (datetime.now(timezone.utc) - valid_time.max().to_pydatetime()).days) if not valid_time.empty else 9999
+    recency = 0.4
+    for band in config["activity_recency_weights"]:
+        if band["max_days"] is None or age_days <= int(band["max_days"]):
+            recency = float(band["weight"])
+            break
+    lowered = name.lower()
+    purpose = "race" if any(word in lowered for word in ("race", "比赛")) else "recovery" if any(word in lowered for word in ("recovery", "恢复")) else "specific_training" if any(word in lowered for word in ("trail", "越野")) else "normal_training"
+    return recency * float(config["activity_type_weights"][purpose])
+
+
 def _flat_source_summary(segments: pd.DataFrame) -> dict[str, float | int | None]:
     if segments.empty:
         return {"segments": 0, "distance_km": 0.0, "median_pace": None, "fast_pace_p25": None}
@@ -279,3 +324,35 @@ def _slope_sample_summary(segments: pd.DataFrame, vertical_column: str) -> dict[
         "vertical_m": round(float(segments[vertical_column].sum()), 1) if not segments.empty else 0.0,
         "duration_hour": round(float(segments["duration_s"].sum()) / 3600.0, 3) if not segments.empty else 0.0,
     }
+
+
+def _uphill_curve(profile: dict[str, object], quality_score: float) -> list[dict[str, object]]:
+    result = []
+    for grade, key in zip((3.0, 7.5, 12.5, 18.0), ("1_percent", "5_percent", "10_percent", "15_percent")):
+        sample = profile.get("_samples", {}).get(key, {})
+        seconds = float(sample.get("duration_hour", 0)) * 3600.0
+        count = int(sample.get("segments", 0))
+        source = "personal" if count else "default"
+        result.append({"grade": grade, "value": float(profile[key]), "unit": "vertical_metres_per_hour",
+                       "confidence": calculate_confidence(seconds, count, quality_score, source=source),
+                       "sample_count": count, "sample_duration_seconds": seconds,
+                       "sample_distance_m": float(sample.get("distance_km", 0)) * 1000.0,
+                       "sample_elevation_m": float(sample.get("vertical_m", 0)), "source": source})
+    return result
+
+
+def _downhill_curve(profile: dict[str, object], quality_score: float) -> list[dict[str, object]]:
+    result = []
+    for grade, key in zip((-3.0, -7.5, -12.5, -18.0), ("-1_percent", "-5_percent", "-10_percent", "-15_percent")):
+        sample = profile.get("_samples", {}).get(key, {})
+        seconds = float(sample.get("duration_hour", 0)) * 3600.0
+        count = int(sample.get("segments", 0))
+        source = "personal" if count else "default"
+        ability = profile[key]
+        result.append({"grade": grade, "speed_mps": float(ability["speed_mps"]),
+                       "vertical_speed_mph": float(ability["vertical_speed_mph"]),
+                       "confidence": calculate_confidence(seconds, count, quality_score, source=source),
+                       "sample_count": count, "sample_duration_seconds": seconds,
+                       "sample_distance_m": float(sample.get("distance_km", 0)) * 1000.0,
+                       "sample_elevation_m": float(sample.get("vertical_m", 0)), "source": source})
+    return result

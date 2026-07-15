@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from analysis.downhill import interpolate_downhill_speed
+from analysis.fatigue import interpolate_fatigue
+from analysis.uphill import interpolate_uphill_vam
 from parser.gpx_reader import route_summary
 
 
@@ -19,7 +22,7 @@ def predict_race(
 
     for segment in segments:
         raw_seconds, basis = _base_segment_seconds(profile, segment)
-        fatigue = fatigue_factor(profile, elapsed_s / 3600.0)
+        fatigue = fatigue_factor(profile, elapsed_s / 3600.0, str(segment.get("type", "flat")))
         # The profile stores retained performance; lower performance means more time.
         seconds = raw_seconds / max(fatigue, 0.1)
         elapsed_s += seconds
@@ -44,8 +47,11 @@ def predict_race(
     }
 
 
-def fatigue_factor(profile: dict[str, object], elapsed_hour: float) -> float:
+def fatigue_factor(profile: dict[str, object], elapsed_hour: float, terrain: str = "flat") -> float:
     fatigue = profile["fatigue"]
+    curve = fatigue.get(terrain)
+    if curve:
+        return interpolate_fatigue(elapsed_hour, curve)
     if elapsed_hour <= 3.0:
         return float(fatigue["3h"])
     if elapsed_hour <= 5.0:
@@ -66,15 +72,23 @@ def _base_segment_seconds(
     distance = float(segment["distance"])
     segment_type = str(segment.get("type", "flat"))
     if segment_type == "uphill":
-        label = "15_percent" if grade >= 15 else "10_percent" if grade >= 10 else "5_percent" if grade >= 5 else "1_percent"
-        vam = float(profile["uphill"][label])
+        curve = profile["uphill"].get("curve", [])
+        if curve:
+            vam = interpolate_uphill_vam(grade, [(float(point["grade"]), float(point["value"])) for point in curve])
+        else:
+            label = "15_percent" if grade >= 15 else "10_percent" if grade >= 10 else "5_percent" if grade >= 5 else "1_percent"
+            vam = float(profile["uphill"][label])
         gain = max(float(segment["gain"]), distance * grade / 100.0)
         climbing_seconds = gain / max(vam, 1.0) * 3600.0
         flat_seconds = distance / 1000.0 * float(profile["flat"]["aerobic_pace"])
         return max(climbing_seconds, flat_seconds), f"{grade:.1f}%坡 / VAM {vam:.0f} m/h"
     if segment_type == "downhill":
-        label = "-15_percent" if grade <= -15 else "-10_percent" if grade <= -10 else "-5_percent" if grade <= -5 else "-1_percent"
-        speed = float(profile["downhill"][label]["speed_mps"])
+        curve = profile["downhill"].get("curve", [])
+        if curve:
+            speed = interpolate_downhill_speed(grade, [(float(point["grade"]), float(point["speed_mps"])) for point in curve])
+        else:
+            label = "-15_percent" if grade <= -15 else "-10_percent" if grade <= -10 else "-5_percent" if grade <= -5 else "-1_percent"
+            speed = float(profile["downhill"][label]["speed_mps"])
         return distance / max(speed, 0.1), f"{grade:.1f}%坡 / 下坡速度 {speed:.2f} m/s"
     pace = float(profile["flat"]["aerobic_pace"])
     return distance / 1000.0 * pace, f"平路配速 {format_pace(pace)}/km"

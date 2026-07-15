@@ -4,6 +4,14 @@ import numpy as np
 import pandas as pd
 
 
+def interpolate_downhill_speed(grade: float, points: list[tuple[float, float]]) -> float:
+    """Linearly interpolate horizontal downhill speed across grade nodes."""
+    if not points:
+        raise ValueError("下坡能力曲线不能为空")
+    ordered = sorted((float(x), float(y)) for x, y in points)
+    return float(np.interp(float(grade), [p[0] for p in ordered], [p[1] for p in ordered]))
+
+
 def build_downhill_profile(intervals: pd.DataFrame) -> dict[str, dict[str, float]]:
     profile: dict[str, dict[str, float]] = {}
     grade = intervals["grade_pct"]

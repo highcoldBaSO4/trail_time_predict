@@ -3,36 +3,69 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
-
-FATIGUE_WINDOWS = ((0.0, 3.0, "3h"), (3.0, 5.0, "5h"), (5.0, float("inf"), "8h"))
-
-
-def build_fatigue_profile(activities: list[pd.DataFrame]) -> dict[str, float]:
-    """Estimate retained speed by elapsed-time window across long activities."""
-    ratios: dict[str, list[float]] = {"3h": [1.0], "5h": [], "8h": []}
-    for activity in activities:
-        valid = activity[activity["valid_interval"]].copy()
-        if valid.empty:
-            continue
-        valid["elapsed_h"] = valid["dt_seconds"].cumsum() / 3600.0
-        baseline = _weighted_speed(valid[valid["elapsed_h"] <= 3.0])
-        if not np.isfinite(baseline) or baseline <= 0:
-            continue
-        for low, high, label in FATIGUE_WINDOWS[1:]:
-            sample = valid[(valid["elapsed_h"] > low) & (valid["elapsed_h"] <= high)]
-            speed = _weighted_speed(sample)
-            if np.isfinite(speed):
-                ratios[label].append(float(np.clip(speed / baseline, 0.5, 1.05)))
-
-    defaults = {"3h": 1.0, "5h": 0.90, "8h": 0.80}
-    return {
-        label: round(float(np.median(values)), 3) if values else default
-        for label, default in defaults.items()
-        for values in [ratios[label]]
-    }
+from analysis.confidence import calculate_confidence
+from config import load_config
 
 
-def _weighted_speed(frame: pd.DataFrame) -> float:
-    seconds = frame["dt_seconds"].sum()
-    return float(frame["dd_m"].sum() / seconds) if seconds > 0 else np.nan
+TERRAIN_METRICS = {"flat": "speed_mps", "uphill": "vam", "downhill": "speed_mps"}
 
+
+def interpolate_fatigue(elapsed_hours: float, points: list[tuple[float, float]] | list[dict[str, float]]) -> float:
+    """Continuously interpolate retained performance over elapsed time."""
+    if not points:
+        raise ValueError("疲劳曲线不能为空")
+    normalized = [(float(p["hour"]), float(p["factor"])) if isinstance(p, dict) else (float(p[0]), float(p[1])) for p in points]
+    normalized.sort()
+    return float(np.interp(max(0.0, float(elapsed_hours)), [p[0] for p in normalized], [p[1] for p in normalized]))
+
+
+def build_fatigue_profile(activities: list[pd.DataFrame]) -> dict[str, object]:
+    """Build separate terrain-normalized fatigue curves with safe defaults."""
+    defaults = load_config()["default_profile"]["fatigue"]
+    curves: dict[str, list[dict[str, float | int | str]]] = {}
+    for terrain in ("flat", "uphill", "downhill"):
+        ratios: dict[float, list[float]] = {3.0: [], 5.0: [], 8.0: []}
+        for activity in activities:
+            samples = _terrain_samples(activity, terrain)
+            baseline = _metric(samples[samples["elapsed_h"] <= 3.0], terrain)
+            if not np.isfinite(baseline) or baseline <= 0:
+                continue
+            for hour, low in ((3.0, 0.0), (5.0, 3.0), (8.0, 5.0)):
+                value = _metric(samples[(samples["elapsed_h"] > low) & (samples["elapsed_h"] <= hour)], terrain)
+                if np.isfinite(value):
+                    ratios[hour].append(float(np.clip(value / baseline, 0.45, 1.05)))
+        curve = []
+        for default in defaults[terrain]:
+            hour = float(default["hour"])
+            if hour == 0.0:
+                curve.append({"hour": 0.0, "factor": 1.0, "sample_count": 0,
+                              "source": "anchor", "confidence": None})
+                continue
+            values = ratios.get(hour, [])
+            source = "personal" if values else "default"
+            curve.append({"hour": hour, "factor": round(float(np.median(values)), 3) if values else float(default["factor"]),
+                          "sample_count": len(values), "source": source,
+                          "confidence": calculate_confidence(len(values) * 1800.0, len(values), source=source)})
+        curves[terrain] = curve
+    # Legacy keys keep the V0.1 UI/report functional during Phase 1.
+    curves["3h"] = interpolate_fatigue(3.0, curves["flat"])
+    curves["5h"] = interpolate_fatigue(5.0, curves["flat"])
+    curves["8h"] = interpolate_fatigue(8.0, curves["flat"])
+    return curves
+
+
+def _terrain_samples(activity: pd.DataFrame, terrain: str) -> pd.DataFrame:
+    valid = activity[activity["valid_interval"].fillna(False)].copy()
+    valid["elapsed_h"] = valid["dt_seconds"].fillna(0).cumsum() / 3600.0
+    grade = valid["grade_pct"]
+    mask = grade.between(-2, 2) if terrain == "flat" else grade > 5 if terrain == "uphill" else grade < -5
+    selected = valid[mask].copy()
+    selected["vam"] = selected["delev_m"].clip(lower=0) / selected["dt_seconds"] * 3600.0
+    return selected
+
+
+def _metric(frame: pd.DataFrame, terrain: str) -> float:
+    seconds = float(frame["dt_seconds"].sum()) if not frame.empty else 0.0
+    if seconds <= 0:
+        return np.nan
+    return float(frame["delev_m"].clip(lower=0).sum() / seconds * 3600.0) if terrain == "uphill" else float(frame["dd_m"].sum() / seconds)

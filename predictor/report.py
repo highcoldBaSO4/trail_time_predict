@@ -18,13 +18,14 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         "",
         f"- 越野平路综合配速：{format_pace(float(flat['aerobic_pace']))}/km",
         f"- 越野平路较快配速（P25）：{format_pace(float(flat['threshold_pace']))}/km",
+        f"- 平路能力可信度：{float(flat.get('confidence', 0.2)):.0%}",
         f"- 合格自然平路样本：{int(flat.get('qualified_segments', 0))} 段，"
         f"共 {float(flat.get('sample_distance_km', 0)):.2f} km",
         "",
         "### 上坡能力",
         "",
-        "| 档位 | 平均坡度 | 等效配速 | VAM | 历史样本 | 累计距离 | 累计高度 |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 档位 | 平均坡度 | 等效配速 | VAM | 可信度 | 历史样本 | 累计距离 | 累计高度 |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     uphill_rows = (
         ("微坡", "1%–5%", "1_percent"),
@@ -34,8 +35,10 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
     )
     for name, grade_range, key in uphill_rows:
         sample = uphill.get("_samples", {}).get(key, {})
+        curve_point = next((point for point in uphill.get("curve", []) if point.get("grade") == {"1_percent": 3.0, "5_percent": 7.5, "10_percent": 12.5, "15_percent": 18.0}[key]), {})
         lines.append(
             f"| {name} | {grade_range} | {_sample_pace(sample)} | {float(uphill[key]):.0f} m/h | "
+            f"{float(curve_point.get('confidence', 0.2)):.0%} | "
             f"{int(sample.get('segments', 0))} 段 | {float(sample.get('distance_km', 0)):.2f} km | "
             f"+{float(sample.get('vertical_m', 0)):.0f} m |"
         )
@@ -44,8 +47,8 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
             "",
             "### 下坡能力",
             "",
-            "| 档位 | 平均坡度 | 等效配速 | VAM | 历史样本 | 累计距离 | 累计高度 |",
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| 档位 | 平均坡度 | 等效配速 | VAM | 可信度 | 历史样本 | 累计距离 | 累计高度 |",
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     downhill_rows = (
@@ -57,10 +60,11 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
     for name, grade_range, key in downhill_rows:
         ability = downhill[key]
         sample = downhill.get("_samples", {}).get(key, {})
+        curve_point = next((point for point in downhill.get("curve", []) if point.get("grade") == {"-1_percent": -3.0, "-5_percent": -7.5, "-10_percent": -12.5, "-15_percent": -18.0}[key]), {})
         speed = float(ability["speed_mps"])
         lines.append(
             f"| {name} | {grade_range} | {_sample_pace(sample, speed) } | "
-            f"-{float(ability['vertical_speed_mph']):.0f} m/h | {int(sample.get('segments', 0))} 段 | "
+            f"-{float(ability['vertical_speed_mph']):.0f} m/h | {float(curve_point.get('confidence', 0.2)):.0%} | {int(sample.get('segments', 0))} 段 | "
             f"{float(sample.get('distance_km', 0)):.2f} km | -{float(sample.get('vertical_m', 0)):.0f} m |"
         )
     lines.extend(
@@ -77,6 +81,14 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
             "> 疲劳修正规则：分段基础耗时 ÷ 能力保留比例。比如保留比例为 80%，该段耗时按 1.25 倍计算。",
         ]
     )
+    lines.extend(["", "### 地形归一化连续疲劳曲线", "", "| 地形 | 时间 | 能力保留 | 可信度 |", "| --- | ---: | ---: | ---: |"])
+    for terrain, label in (("flat", "平路"), ("uphill", "上坡"), ("downhill", "下坡")):
+        for point in fatigue.get(terrain, []):
+            confidence = "—（固定基准）" if point.get("source") == "anchor" else f"{float(point.get('confidence', 0.2)):.0%}"
+            lines.append(f"| {label} | {float(point['hour']):g}h | {float(point['factor']):.0%} | {confidence} |")
+    quality = profile.get("data_quality", {})
+    lines.extend(["", "### 数据质量", "", f"- 综合评分：{float(quality.get('score', 0.2)):.0%}",
+                  f"- 建议用于建模：{int(quality.get('recommended_count', 0))}/{int(profile.get('sample_count', 0))} 个活动"])
     lines.extend(
         [
         "",

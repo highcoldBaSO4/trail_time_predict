@@ -12,6 +12,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analysis.activity_analysis import analyze_activity
 from analysis.capability import build_runner_profile
+from analysis.confidence import calculate_confidence
+from analysis.data_quality import diagnose_fit, diagnose_gpx
+from analysis.downhill import interpolate_downhill_speed
+from analysis.fatigue import interpolate_fatigue
+from analysis.uphill import interpolate_uphill_vam
+from config import load_config
+from models import CapabilityValue
 from parser.gpx_reader import build_race_segments, read_gpx, route_summary
 from parser import fit_reader
 from predictor.race_predictor import predict_race
@@ -87,7 +94,7 @@ def test_profile_and_report_expose_four_slope_bands() -> None:
     assert "微坡" in report and "缓坡" in report and "中坡" in report and "陡坡" in report
     assert "微下降" in report and "陡下降" in report
     assert "水平速度" not in report
-    assert "| 档位 | 平均坡度 | 等效配速 | VAM | 历史样本 | 累计距离 | 累计高度 |" in report
+    assert "| 档位 | 平均坡度 | 等效配速 | VAM | 可信度 | 历史样本 | 累计距离 | 累计高度 |" in report
     assert "m/h" in report
     assert "长时间疲劳衰减" in report
     assert "能力保留比例" in report
@@ -170,3 +177,44 @@ def test_fit_reader_keeps_records_before_trailing_parse_error(monkeypatch, tmp_p
         frame = fit_reader.read_fit(tmp_path / "partial.fit")
 
     assert len(frame) == 1
+
+
+def test_config_and_typed_capability_model() -> None:
+    assert load_config()["confidence"]["default"] == 0.20
+    value = CapabilityValue(420, "seconds_per_km", "personal", 0.8, sample_count=4)
+    assert value.sample_count == 4
+
+
+def test_continuous_capability_and_fatigue_interpolation() -> None:
+    assert interpolate_uphill_vam(10.0, [(5.0, 500.0), (15.0, 400.0)]) == pytest.approx(450.0)
+    assert interpolate_downhill_speed(-10.0, [(-15.0, 2.0), (-5.0, 3.0)]) == pytest.approx(2.5)
+    assert interpolate_fatigue(4.0, [(3.0, 1.0), (5.0, 0.8)]) == pytest.approx(0.9)
+
+
+def test_confidence_and_fit_quality_safe_defaults() -> None:
+    assert calculate_confidence(0, 0, source="default") == 0.2
+    report = diagnose_fit(synthetic_activity())
+    assert report["level"] in {"高", "中", "低"}
+    assert 0 <= report["score"] <= 1
+
+
+def test_gpx_quality_reports_multiscale_gain() -> None:
+    points = [
+        {"latitude": 0.0, "longitude": i * 0.001, "elevation": float(i * 5)}
+        for i in range(6)
+    ]
+    report = diagnose_gpx(points)
+    assert report["point_count"] == 6
+    assert set(report["resampled_gain_m"]) == {"50", "100", "200"}
+
+
+def test_profile_exposes_quality_confidence_and_continuous_curves() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    assert profile["schema_version"] == "0.2-phase1"
+    assert 0 <= profile["flat"]["confidence"] <= 1
+    assert len(profile["uphill"]["curve"]) == 4
+    assert len(profile["downhill"]["curve"]) == 4
+    assert {"flat", "uphill", "downhill"} <= set(profile["fatigue"])
+    for terrain in ("flat", "uphill", "downhill"):
+        anchor = profile["fatigue"][terrain][0]
+        assert anchor == {"hour": 0.0, "factor": 1.0, "sample_count": 0, "source": "anchor", "confidence": None}
