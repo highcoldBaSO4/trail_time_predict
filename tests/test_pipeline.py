@@ -19,9 +19,10 @@ from analysis.fatigue import interpolate_fatigue
 from analysis.uphill import interpolate_uphill_vam
 from config import load_config
 from models import CapabilityValue
+from models import RaceCondition
 from parser.gpx_reader import build_race_segments, read_gpx, route_summary
 from parser import fit_reader
-from predictor.race_predictor import predict_race
+from predictor.race_predictor import format_duration, predict_race
 from predictor.report import build_markdown_report
 
 
@@ -218,3 +219,46 @@ def test_profile_exposes_quality_confidence_and_continuous_curves() -> None:
     for terrain in ("flat", "uphill", "downhill"):
         anchor = profile["fatigue"][terrain][0]
         assert anchor == {"hour": 0.0, "factor": 1.0, "sample_count": 0, "source": "anchor", "confidence": None}
+
+
+def test_profile_exposes_duration_capability_layers() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    layers = profile["duration_capabilities"]
+    assert [layer["name"] for layer in layers] == ["short", "medium", "long", "ultra"]
+    assert layers[0]["terrain_source"]["uphill"] == "personal"
+    assert layers[-1]["source"] == "fallback"
+    assert all("terrain_confidence" in layer for layer in layers)
+
+
+def test_phase2_prediction_conditions_and_probability_order() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    segments = [{"index": 1, "name": "flat_1", "start_km": 0.0, "end_km": 10.0,
+                 "distance": 10000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
+                 "max_grade": 0.0, "type": "flat", "terrain": "平路"}]
+    normal = predict_race(profile, segments, simulations=1000, seed=7)
+    difficult = predict_race(
+        profile, segments, condition=RaceCondition(current_form="poor", temperature_c=30,
+                                                   humidity_percent=85, terrain_technical_level=4,
+                                                   mud_level=3, night_running_ratio=0.5,
+                                                   carried_weight_kg=2, aid_station_minutes=10),
+        simulations=1000, seed=7,
+    )
+    assert difficult["adjusted_moving_time_seconds"] > difficult["standard_moving_time_seconds"]
+    assert difficult["median_finish_time_seconds"] > normal["median_finish_time_seconds"]
+    assert difficult["optimistic_time_seconds"] <= difficult["median_finish_time_seconds"] <= difficult["conservative_time_seconds"]
+    assert difficult["adjustment_breakdown"]["technical"] > 0
+    assert difficult["aid_station_time_seconds"] == 600
+
+
+def test_phase2_monte_carlo_is_reproducible() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    segments = [{"distance": 1000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
+                 "type": "flat", "start_km": 0.0, "end_km": 1.0}]
+    first = predict_race(profile, segments, simulations=1000, seed=99)
+    second = predict_race(profile, segments, simulations=1000, seed=99)
+    assert first["probability"] == second["probability"]
+
+
+def test_negative_time_impact_formats_with_a_single_sign() -> None:
+    assert format_duration(-7 * 60) == "-7分钟"
+    assert format_duration(-67 * 60) == "-1小时07分钟"

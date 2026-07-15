@@ -99,33 +99,64 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         f"- 累计下降：{float(route['elevation_loss']):.0f} m",
         f"- 自然爬坡：{int(route.get('climbs', 0))} 个",
         f"- 自然下降：{int(route.get('descents', 0))} 个",
-        f"- 预计移动时间：{format_duration(float(prediction['moving_time_seconds']))}",
+        f"- 标准能力移动时间：{format_duration(float(prediction.get('standard_moving_time_seconds', prediction['moving_time_seconds'])))}",
+        f"- 状态与条件修正后移动时间：{format_duration(float(prediction.get('adjusted_moving_time_seconds', prediction['moving_time_seconds'])))}",
         f"- 补给时间：{format_duration(float(prediction['aid_time_seconds']))}",
-        f"- 最终预测：**{format_duration(float(prediction['total_time_seconds']))}**",
+        f"- 最快合理时间 P10：{format_duration(float(prediction.get('optimistic_time_seconds', prediction['total_time_seconds'])))}",
+        f"- 最终预测（中位 P50）：**{format_duration(float(prediction.get('median_finish_time_seconds', prediction['total_time_seconds'])))}**",
+        f"- 保守预测时间 P90：{format_duration(float(prediction.get('conservative_time_seconds', prediction['total_time_seconds'])))}",
+        f"- 预测可信度：{float(prediction.get('confidence', 0.2)):.0%}",
         "",
+        "### 目标时长能力匹配",
+        "",
+        f"- 迭代预计时长：{float(prediction.get('duration_match', {}).get('estimated_hours', 0)):.2f} 小时",
+        f"- 是否收敛：{'是' if prediction.get('duration_match', {}).get('converged', True) else '否'}",
+        "",
+        "| 地形 | 持续能力层权重 | 耗时系数 | 可信度 | 来源 |",
+        "| --- | --- | ---: | ---: | --- |",
         "## 分段预测",
         "",
-        "| 公里 | 地形 | 距离 | 平均坡度 | 最大坡度 | 爬升/下降 | 疲劳因子 | 预测时间 |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 公里 | 地形 | 距离 | 平均坡度 | 最大坡度 | 爬升/下降 | 时长适配 | 疲劳因子 | 条件系数 | 预测时间 |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
+    terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
+    duration_terrain = prediction.get("duration_match", {}).get("terrain", {})
+    duration_rows = []
+    for terrain in ("flat", "uphill", "downhill"):
+        match = duration_terrain.get(terrain, {})
+        weights = "、".join(f"{name} {float(weight):.0%}" for name, weight in match.get("weights", {}).items()) or "—"
+        duration_rows.append(f"| {terrain_labels[terrain]} | {weights} | ×{float(match.get('factor', 1)):.3f} | {float(match.get('confidence', .2)):.0%} | {match.get('source', 'legacy')} |")
+    insertion = lines.index("## 分段预测")
+    lines[insertion:insertion] = duration_rows + ["", "### 时间损耗拆解", "", "| 项目 | 时间影响 |", "| --- | ---: |"] + [
+        f"| {_breakdown_label(key)} | {format_duration(float(value))} |" for key, value in prediction.get("adjustment_breakdown", {}).items()
+    ] + [""]
     for row in prediction["segments"]:
         lines.append(
             f"| {float(row['start_km']):.1f}-{float(row['end_km']):.1f} | "
             f"{row.get('terrain', row['type'])} | {float(row['distance']) / 1000.0:.2f} km | "
             f"{float(row['grade']):.1f}% | {float(row.get('max_grade', row['grade'])):.1f}% | "
             f"+{float(row['gain']):.0f}/-{float(row['loss']):.0f} m | "
+            f"×{float(row.get('duration_factor', 1)):.3f} | "
             f"{float(row['fatigue_factor']) * 100:.0f}% | "
+            f"×{float(row.get('condition_factor', 1)):.3f} | "
             f"{format_duration(float(row['predicted_time_seconds']))} |"
         )
     lines.extend(
         [
             "",
-            "> 说明：这是基于历史运动表现和路线海拔的移动时间估算。天气、路况、技术难度、补给和停留需另行修正。",
+            "> 说明：标准能力时间表示正常状态和正常条件下的移动时间；最终区间进一步考虑用户填写的状态、天气、路况、技术难度、负重、补给及模型不确定性。",
             "",
         ]
     )
     return "\n".join(lines)
+
+
+def _breakdown_label(key: str) -> str:
+    return {"base_terrain": "基础地形耗时", "duration_adaptation": "目标时长适配", "fatigue": "疲劳增加",
+            "form": "当前状态", "technical": "技术难度", "mud": "泥泞", "night": "夜间",
+            "altitude": "高海拔", "carried_weight": "装备负重", "weather": "温湿度",
+            "aid_station": "补给停留"}.get(key, key)
 
 
 def save_markdown_report(report: str, path: str | Path) -> None:

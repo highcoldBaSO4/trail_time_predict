@@ -40,6 +40,7 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
         activity["_activity_name"] = name
         activity["_activity_type"] = activity_type
         activity["_model_weight"] = _activity_weight(name, activity)
+        activity["_activity_duration_h"] = float(activity["dt_seconds"].fillna(0).clip(lower=0).sum()) / 3600.0
         enriched.append(activity)
         terrain_segments.extend(_activity_terrain_segments(activity, name, activity_type))
     segment_frame = pd.DataFrame(terrain_segments)
@@ -49,6 +50,7 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
     downhill = {**DEFAULT_PROFILE["downhill"], **_build_downhill_profile(segment_frame)}
     uphill["curve"] = _uphill_curve(uphill, quality_score)
     downhill["curve"] = _downhill_curve(downhill, quality_score)
+    duration_capabilities = _build_duration_capabilities(segment_frame, flat, uphill, downhill, quality_score)
     activity_summaries = []
     for name, frame in activities.items():
         summary = analyze_activity(frame, name)
@@ -67,6 +69,7 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
         "uphill": uphill,
         "downhill": downhill,
         "fatigue": build_fatigue_profile(enriched),
+        "duration_capabilities": duration_capabilities,
         "activities": activity_summaries,
         "terrain_segments": {
             "total": len(terrain_segments),
@@ -155,6 +158,8 @@ def _activity_terrain_segments(
     )
     block_ids = (~valid).cumsum()
     segments: list[dict[str, float | str]] = []
+    activity_start = activity["timestamp"].min()
+    activity_duration_h = float(activity["_activity_duration_h"].iloc[0])
     for _, block in activity.loc[valid].groupby(block_ids[valid], sort=False):
         distance = block["dd_m"].to_numpy(dtype=float)
         seconds = block["dt_seconds"].to_numpy(dtype=float)
@@ -197,6 +202,8 @@ def _activity_terrain_segments(
             gain = sum(max(item["elevation_delta"], 0.0) for item in selected)
             loss = sum(max(-item["elevation_delta"], 0.0) for item in selected)
             grade = sum(item["grade"] * item["distance"] for item in selected) / segment_distance
+            block_start_elapsed_h = max(0.0, (block["timestamp"].iloc[0] - activity_start).total_seconds() / 3600.0)
+            segment_start_elapsed_h = block_start_elapsed_h + float(edge_seconds[start]) / 3600.0
             segments.append(
                 {
                     "activity": activity_name,
@@ -210,6 +217,9 @@ def _activity_terrain_segments(
                     "pace": duration / segment_distance * 1000.0,
                     "speed_mps": segment_distance / duration,
                     "model_weight": float(block["_model_weight"].iloc[0]),
+                    "activity_duration_h": float(block["_activity_duration_h"].iloc[0]),
+                    "activity_elapsed_h": segment_start_elapsed_h,
+                    "activity_progress": min(1.0, segment_start_elapsed_h / max(activity_duration_h, 1e-6)),
                 }
             )
     return segments
@@ -356,3 +366,72 @@ def _downhill_curve(profile: dict[str, object], quality_score: float) -> list[di
                        "sample_distance_m": float(sample.get("distance_km", 0)) * 1000.0,
                        "sample_elevation_m": float(sample.get("vertical_m", 0)), "source": source})
     return result
+
+
+def _build_duration_capabilities(
+    segments: pd.DataFrame,
+    global_flat: dict[str, object],
+    global_uphill: dict[str, object],
+    global_downhill: dict[str, object],
+    quality_score: float,
+) -> list[dict[str, object]]:
+    """Build sustainable ability layers from activities of similar duration."""
+    result: list[dict[str, object]] = []
+    for layer in load_config()["duration_capability"]["layers"]:
+        if segments.empty:
+            selected = segments
+        else:
+            selected = segments[segments["activity_duration_h"] >= float(layer["min_hours"])]
+            if layer["max_hours"] is not None:
+                selected = selected[selected["activity_duration_h"] < float(layer["max_hours"])]
+        # Sustainable ability is estimated from the paced opening portion;
+        # later segments belong to the separate fatigue model.
+        ability_segments = selected[selected["activity_progress"] <= 0.40] if not selected.empty else selected
+        segment_count = len(ability_segments)
+        if segment_count:
+            flat = _build_flat_profile(ability_segments, quality_score)
+            uphill = {**DEFAULT_PROFILE["uphill"], **_build_uphill_profile(ability_segments)}
+            downhill = {**DEFAULT_PROFILE["downhill"], **_build_downhill_profile(ability_segments)}
+            uphill["curve"] = _uphill_curve(uphill, quality_score)
+            downhill["curve"] = _downhill_curve(downhill, quality_score)
+            factors = _duration_factors(flat, uphill, downhill, global_flat, global_uphill, global_downhill)
+            terrain_counts = {terrain: int((ability_segments["type"] == terrain).sum()) for terrain in ("flat", "uphill", "downhill")}
+            terrain_confidence = {terrain: calculate_confidence(float(ability_segments.loc[ability_segments["type"] == terrain, "duration_s"].sum()), count, quality_score,
+                                                                 source="personal" if count else "default") for terrain, count in terrain_counts.items()}
+            terrain_source = {terrain: "personal" if count else "fallback" for terrain, count in terrain_counts.items()}
+            fallback = float(layer["fallback_time_factor"])
+            for terrain, count in terrain_counts.items():
+                if not count:
+                    factors[terrain] = fallback
+            source = "personal" if all(terrain_counts.values()) else "mixed"
+            confidence = sum(terrain_confidence.values()) / len(terrain_confidence)
+        else:
+            flat, uphill, downhill = {}, {}, {}
+            fallback = float(layer["fallback_time_factor"])
+            factors = {"flat": fallback, "uphill": fallback, "downhill": fallback}
+            source = "fallback"
+            confidence = calculate_confidence(0, 0, source="default")
+            terrain_counts = {terrain: 0 for terrain in ("flat", "uphill", "downhill")}
+            terrain_confidence = {terrain: confidence for terrain in terrain_counts}
+            terrain_source = {terrain: "fallback" for terrain in terrain_counts}
+        result.append({
+            "name": layer["name"], "label": layer["label"], "min_hours": float(layer["min_hours"]),
+            "max_hours": None if layer["max_hours"] is None else float(layer["max_hours"]),
+            "center_hours": float(layer["center_hours"]), "time_factors": factors,
+            "confidence": confidence, "sample_count": segment_count, "source": source,
+            "terrain_sample_count": terrain_counts, "terrain_confidence": terrain_confidence,
+            "terrain_source": terrain_source,
+            "flat": flat, "uphill": uphill, "downhill": downhill,
+        })
+    return result
+
+
+def _duration_factors(
+    flat: dict[str, object], uphill: dict[str, object], downhill: dict[str, object],
+    global_flat: dict[str, object], global_uphill: dict[str, object], global_downhill: dict[str, object],
+) -> dict[str, float]:
+    flat_factor = float(flat.get("aerobic_pace", global_flat["aerobic_pace"])) / float(global_flat["aerobic_pace"])
+    up_ratios = [float(global_uphill[key]) / max(float(uphill[key]), 1.0) for key in ("1_percent", "5_percent", "10_percent", "15_percent")]
+    down_ratios = [float(global_downhill[key]["speed_mps"]) / max(float(downhill[key]["speed_mps"]), 0.1) for key in ("-1_percent", "-5_percent", "-10_percent", "-15_percent")]
+    return {"flat": round(float(np.median(flat_factor)), 3), "uphill": round(float(np.median(up_ratios)), 3),
+            "downhill": round(float(np.median(down_ratios)), 3)}

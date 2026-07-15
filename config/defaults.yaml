@@ -43,3 +43,45 @@ quality:
   max_altitude_jump_m: 50.0
   max_timestamp_gap_seconds: 120.0
   gpx_resample_distances_m: [50.0, 100.0, 200.0]
+
+duration_capability:
+  layers:
+    - {name: short, label: 短时, min_hours: 0.0, max_hours: 2.0, center_hours: 1.0, fallback_time_factor: 0.96}
+    - {name: medium, label: 中时, min_hours: 2.0, max_hours: 5.0, center_hours: 3.5, fallback_time_factor: 1.00}
+    - {name: long, label: 长时, min_hours: 5.0, max_hours: 10.0, center_hours: 7.5, fallback_time_factor: 1.08}
+    - {name: ultra, label: 超长, min_hours: 10.0, max_hours: null, center_hours: 12.0, fallback_time_factor: 1.16}
+  convergence_tolerance_seconds: 30.0
+  max_iterations: 8
+
+conditions:
+  current_form:
+    very_good: {label: 状态很好, factor: 0.97}
+    normal: {label: 状态正常, factor: 1.00}
+    slight_fatigue: {label: 轻微疲劳, factor: 1.04}
+    poor: {label: 状态较差, factor: 1.08}
+    ill_or_injured: {label: 生病或伤病, factor: 1.15}
+  technical_factors:
+    0: {flat: 1.00, uphill: 1.00, downhill: 1.00}
+    1: {flat: 1.01, uphill: 1.02, downhill: 1.04}
+    2: {flat: 1.03, uphill: 1.04, downhill: 1.09}
+    3: {flat: 1.05, uphill: 1.07, downhill: 1.16}
+    4: {flat: 1.08, uphill: 1.12, downhill: 1.28}
+  mud_per_level: {flat: 0.015, uphill: 0.025, downhill: 0.04}
+  night_max: {flat: 0.03, uphill: 0.05, downhill: 0.10}
+  carried_weight_per_kg: {flat: 0.003, uphill: 0.006, downhill: 0.002}
+  heat:
+    threshold_c: 20.0
+    per_degree: 0.004
+    humidity_threshold_percent: 70.0
+    humidity_per_percent: 0.001
+
+monte_carlo:
+  simulations: 3000
+  min_simulations: 1000
+  max_simulations: 10000
+  seed: 2026
+  sigma_at_confidence_zero: 0.16
+  sigma_at_confidence_one: 0.025
+  condition_sigma: 0.02
+  gpx_sigma_high_quality: 0.01
+  gpx_sigma_low_quality: 0.06

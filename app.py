@@ -10,6 +10,8 @@ import pandas as pd
 import streamlit as st
 
 from analysis.capability import build_runner_profile
+from analysis.data_quality import diagnose_gpx
+from models import RaceCondition
 from parser.fit_reader import read_fit
 from parser.gpx_reader import build_race_segments, read_gpx
 from predictor.race_predictor import format_duration, format_pace, predict_race
@@ -116,6 +118,8 @@ def calculate_prediction(
     gpx_file: Any,
     sample_distance: float,
     aid_minutes: float,
+    condition: RaceCondition | None = None,
+    simulations: int = 3000,
 ) -> dict[str, Any]:
     total_steps = len(fit_files) + 4
     completed = 0
@@ -141,12 +145,16 @@ def calculate_prediction(
         with tempfile.TemporaryDirectory() as temp_dir:
             gpx_path = Path(temp_dir) / "race.gpx"
             gpx_path.write_bytes(gpx_file.getvalue())
-            segments = build_race_segments(read_gpx(gpx_path), sample_distance)
+            points = read_gpx(gpx_path)
+            gpx_quality = diagnose_gpx(points)
+            segments = build_race_segments(points, sample_distance)
         completed += 1
         progress.progress(completed / total_steps, text=f"已识别 {len(segments)} 个自然地形段")
 
         status.write("匹配个人能力并计算逐段时间……")
-        prediction = predict_race(profile, segments, aid_minutes)
+        prediction = predict_race(profile, segments, aid_minutes, condition=condition,
+                                  simulations=simulations, gpx_quality_score=float(gpx_quality["score"]))
+        prediction["gpx_data_quality"] = gpx_quality
         completed += 1
         progress.progress(completed / total_steps, text="逐段预测已完成")
 
@@ -175,6 +183,21 @@ def elevation_figure(segments: list[dict[str, Any]]) -> plt.Figure:
     axis.spines[["top", "right", "left"]].set_visible(False)
     axis.spines["bottom"].set_color("#dfe4ea")
     axis.tick_params(colors="#667085", labelsize=9)
+    figure.tight_layout()
+    return figure
+
+
+def probability_figure(samples: list[float], p10: float, p50: float, p90: float) -> plt.Figure:
+    """Render the Monte Carlo finish-time distribution in hours."""
+    hours = [value / 3600.0 for value in samples]
+    figure, axis = plt.subplots(figsize=(9, 3.4))
+    figure.patch.set_facecolor("white")
+    axis.hist(hours, bins=45, color="#16833d", alpha=0.72, edgecolor="white")
+    for value, label, color in ((p10, "P10", "#16833d"), (p50, "P50", "#f56b0a"), (p90, "P90", "#8f3f71")):
+        axis.axvline(value / 3600.0, color=color, linewidth=2, label=f"{label} {value / 3600:.2f}h")
+    axis.set(xlabel="完赛时间（小时）", ylabel="模拟次数")
+    axis.legend(frameon=False)
+    axis.grid(axis="y", alpha=.15)
     figure.tight_layout()
     return figure
 
@@ -223,7 +246,7 @@ def render_result(result: dict[str, Any]) -> None:
     with header_left:
         st.markdown('<div class="result-kicker">预计完赛时间</div>', unsafe_allow_html=True)
         st.markdown(
-            f'<div class="result-time">{format_duration(float(prediction["total_time_seconds"]))}</div>',
+            f'<div class="result-time">{format_duration(float(prediction["median_finish_time_seconds"]))}</div>',
             unsafe_allow_html=True,
         )
     with download_md:
@@ -244,10 +267,10 @@ def render_result(result: dict[str, Any]) -> None:
         )
 
     metric1, metric2, metric3, metric4 = st.columns(4)
-    metric1.metric("比赛距离", f"{float(route['distance_km']):.2f} km")
-    metric2.metric("累计爬升", f"{float(route['elevation_gain']):.0f} m")
-    metric3.metric("自然爬坡", f"{int(route.get('climbs', 0))} 个")
-    metric4.metric("历史活动", f"{int(profile['sample_count'])} 个")
+    metric1.metric("最快合理 P10", format_duration(float(prediction["optimistic_time_seconds"])))
+    metric2.metric("中位预测 P50", format_duration(float(prediction["median_finish_time_seconds"])))
+    metric3.metric("保守预测 P90", format_duration(float(prediction["conservative_time_seconds"])))
+    metric4.metric("预测可信度", f"{float(prediction['confidence']):.0%}")
 
     st.subheader("路线海拔剖面")
     figure = elevation_figure(prediction["segments"])
@@ -264,8 +287,10 @@ def render_result(result: dict[str, Any]) -> None:
             overview = pd.DataFrame(
                 [
                     ["预计移动时间", format_duration(float(prediction["moving_time_seconds"]))],
+                    ["标准能力移动时间", format_duration(float(prediction["standard_moving_time_seconds"]))],
+                    ["条件修正后移动时间", format_duration(float(prediction["adjusted_moving_time_seconds"]))],
                     ["补给与停留", format_duration(float(prediction["aid_time_seconds"]))],
-                    ["最终预测", format_duration(float(prediction["total_time_seconds"]))],
+                    ["最终中位预测 P50", format_duration(float(prediction["median_finish_time_seconds"]))],
                 ],
                 columns=["项目", "结果"],
             )
@@ -281,6 +306,22 @@ def render_result(result: dict[str, Any]) -> None:
                 columns=["项目", "结果"],
             )
             st.dataframe(route_data, hide_index=True, width="stretch")
+        st.subheader("预测时间分布")
+        distribution = probability_figure(prediction["probability"]["samples_seconds"],
+                                          float(prediction["optimistic_time_seconds"]),
+                                          float(prediction["median_finish_time_seconds"]),
+                                          float(prediction["conservative_time_seconds"]))
+        st.pyplot(distribution, width="stretch")
+        plt.close(distribution)
+        st.subheader("时间损耗拆解")
+        labels = {"base_terrain": "基础地形", "duration_adaptation": "目标时长适配", "fatigue": "疲劳",
+                  "form": "当前状态", "technical": "技术难度", "mud": "泥泞", "night": "夜间",
+                  "altitude": "高海拔", "carried_weight": "负重", "weather": "温湿度", "aid_station": "补给停留"}
+        breakdown = pd.DataFrame([[labels.get(key, key), format_duration(float(value))]
+                                  for key, value in prediction["adjustment_breakdown"].items()], columns=["项目", "时间影响"])
+        st.dataframe(breakdown, hide_index=True, width="stretch")
+        for note in prediction.get("risk_notes", []):
+            st.warning(note)
 
     with ability_tab:
         flat = profile["flat"]
@@ -320,10 +361,12 @@ def render_result(result: dict[str, Any]) -> None:
     with segment_tab:
         segment_frame = pd.DataFrame(prediction["segments"])
         display = segment_frame[
-            ["start_km", "end_km", "terrain", "distance", "grade", "max_grade", "gain", "loss", "fatigue_factor", "predicted_time_seconds"]
+            ["start_km", "end_km", "terrain", "distance", "grade", "max_grade", "gain", "loss", "duration_factor", "fatigue_factor", "condition_factor", "predicted_time_seconds"]
         ].copy()
-        display.columns = ["起点km", "终点km", "地形", "距离m", "平均坡度%", "最陡坡度%", "爬升m", "下降m", "疲劳因子", "预测秒"]
+        display.columns = ["起点km", "终点km", "地形", "距离m", "平均坡度%", "最陡坡度%", "爬升m", "下降m", "时长适配", "疲劳因子", "条件系数", "预测秒"]
+        display["时长适配"] = display["时长适配"].map(lambda factor: f"×{float(factor):.3f}")
         display["疲劳因子"] = display["疲劳因子"].map(lambda factor: f"{float(factor) * 100:.0f}%")
+        display["条件系数"] = display["条件系数"].map(lambda factor: f"×{float(factor):.3f}")
         display["预测时间"] = display.pop("预测秒").map(lambda seconds: format_duration(float(seconds)))
         st.dataframe(display, hide_index=True, width="stretch", height=460)
 
@@ -366,13 +409,32 @@ with st.sidebar:
     aid_minutes = st.number_input(
         "预计补给与停留（分钟）", min_value=0, max_value=600, value=0, step=5,
     )
+    st.markdown("**当前状态与比赛条件**")
+    form_labels = {"状态很好": "very_good", "状态正常": "normal", "轻微疲劳": "slight_fatigue",
+                   "状态较差": "poor", "生病或伤病": "ill_or_injured"}
+    current_form_label = st.selectbox("当前状态", list(form_labels), index=1)
+    temperature = st.number_input("温度（℃）", min_value=-20, max_value=60, value=20, step=1)
+    humidity = st.number_input("湿度（%）", min_value=0, max_value=100, value=60, step=5)
+    technical_level = st.select_slider("技术难度", options=[0, 1, 2, 3, 4], value=0,
+                                       format_func=lambda value: ["公路/平整林道", "简单山径", "普通山径", "中等技术", "高技术"][value])
+    mud_level = st.select_slider("泥泞等级", options=[0, 1, 2, 3, 4], value=0)
+    night_ratio_percent = st.slider("夜间路段比例（%）", 0, 100, 0, 5)
+    altitude_factor = st.number_input("高海拔耗时系数", min_value=0.80, max_value=1.50, value=1.00, step=0.01)
+    carried_weight = st.number_input("携带重量（kg）", min_value=0.0, max_value=20.0, value=0.0, step=0.5)
+    simulations = st.select_slider("模拟次数", options=[1000, 3000, 5000, 10000], value=3000)
 
     step_heading(4, "开始计算")
     can_calculate = bool(fit_files and gpx_file)
     if st.button("开始计算", type="primary", disabled=not can_calculate, width="stretch"):
         try:
             st.session_state["prediction_result"] = calculate_prediction(
-                fit_files, gpx_file, float(sample_distance), float(aid_minutes)
+                fit_files, gpx_file, float(sample_distance), float(aid_minutes),
+                RaceCondition(current_form=form_labels[current_form_label], temperature_c=float(temperature),
+                              humidity_percent=float(humidity), altitude_factor=float(altitude_factor),
+                              terrain_technical_level=int(technical_level), mud_level=int(mud_level),
+                              night_running_ratio=float(night_ratio_percent) / 100.0,
+                              carried_weight_kg=float(carried_weight), aid_station_minutes=float(aid_minutes)),
+                int(simulations),
             )
         except Exception as exc:
             st.session_state.pop("prediction_result", None)
@@ -380,9 +442,9 @@ with st.sidebar:
     if not can_calculate:
         st.caption("上传 FIT 和 GPX 后即可开始计算。")
 
-st.markdown("# 越野跑比赛时间预测")
+st.markdown("# 越野跑比赛时间概率预测")
 st.markdown(
-    '<div class="app-subtitle">从历史活动建立个人地形能力画像，并按比赛自然坡段预测完成时间。</div>',
+    '<div class="app-subtitle">结合持续能力、当天状态和比赛条件，输出可解释的 P10–P90 完赛时间区间。</div>',
     unsafe_allow_html=True,
 )
 

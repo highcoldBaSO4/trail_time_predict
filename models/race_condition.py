@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+
+
+@dataclass(frozen=True)
+class RaceCondition:
+    current_form: str = "normal"
+    temperature_c: float | None = None
+    humidity_percent: float | None = None
+    altitude_factor: float = 1.0
+    terrain_technical_level: int = 0
+    mud_level: int = 0
+    night_running_ratio: float = 0.0
+    carried_weight_kg: float = 0.0
+    aid_station_minutes: float = 0.0
+
+    def normalized(self) -> "RaceCondition":
+        """Clamp user-controlled fields to safe model ranges."""
+        return RaceCondition(
+            current_form=self.current_form,
+            temperature_c=self.temperature_c,
+            humidity_percent=None if self.humidity_percent is None else min(100.0, max(0.0, self.humidity_percent)),
+            altitude_factor=max(0.8, min(1.5, self.altitude_factor)),
+            terrain_technical_level=max(0, min(4, int(self.terrain_technical_level))),
+            mud_level=max(0, min(4, int(self.mud_level))),
+            night_running_ratio=max(0.0, min(1.0, self.night_running_ratio)),
+            carried_weight_kg=max(0.0, self.carried_weight_kg),
+            aid_station_minutes=max(0.0, self.aid_station_minutes),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return asdict(self)
