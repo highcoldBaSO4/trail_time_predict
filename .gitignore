@@ -1,11 +1,61 @@
+# Python bytecode and caches
 __pycache__/
 *.py[cod]
-.venv/
+*$py.class
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.tox/
+.nox/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging and test output
+build/
+dist/
+*.egg-info/
+.coverage
+.coverage.*
+htmlcov/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# IDE and editor files
+.idea/
+.vscode/
+*.code-workspace
+*.swp
+*.swo
+
+# Operating-system files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+*.bak
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Generated prediction output
 output/*
 !output/.gitkeep
+
+# Personal activity and race data
 data/activities/*
 !data/activities/.gitkeep
 data/races/*
 !data/races/.gitkeep
-
