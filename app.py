@@ -30,6 +30,15 @@ plt.rcParams["axes.unicode_minus"] = False
 
 logger = logging.getLogger(__name__)
 
+
+class AnalysisStageError(RuntimeError):
+    """Attach a user-facing pipeline stage to an unexpected failure."""
+
+    def __init__(self, stage: str, cause: Exception):
+        super().__init__(f"{stage}失败：{type(cause).__name__}: {cause}")
+        self.stage = stage
+        self.cause = cause
+
 MAX_FIT_FILES = 30
 MAX_SINGLE_FILE_MB = 20
 MAX_TOTAL_UPLOAD_MB = 100
@@ -193,21 +202,31 @@ def calculate_prediction(
     progress = st.progress(0, text="准备建立能力画像……")
     with st.status("正在建立个人能力画像", expanded=True) as status:
         status.write(f"使用已确认的 {len(activities)} 个活动识别自然爬坡、下降和平路……")
-        profile = build_runner_profile(
-            activities,
-            activity_types,
-            progress=lambda message: status.write(message.strip()),
-        )
+        try:
+            profile = build_runner_profile(
+                activities,
+                activity_types,
+                progress=lambda message: status.write(message.strip()),
+            )
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise AnalysisStageError("个人能力画像生成", exc) from exc
         completed += 1
         progress.progress(completed / total_steps, text="个人能力画像已生成")
 
         status.write("解析比赛路线并识别自然坡段……")
-        with tempfile.TemporaryDirectory() as temp_dir:
-            gpx_path = Path(temp_dir) / "race.gpx"
-            gpx_path.write_bytes(gpx_file.getvalue())
-            points = read_gpx(gpx_path)
-            gpx_quality = diagnose_gpx(points)
-            segments = build_race_segments(points, sample_distance)
+        try:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                gpx_path = Path(temp_dir) / "race.gpx"
+                gpx_path.write_bytes(gpx_file.getvalue())
+                points = read_gpx(gpx_path)
+                gpx_quality = diagnose_gpx(points)
+                segments = build_race_segments(points, sample_distance)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise AnalysisStageError("比赛路线解析与分段", exc) from exc
         completed += 1
         micro_count = sum(len(list(segment.get("micro_segments", []))) for segment in segments)
         progress.progress(
@@ -216,13 +235,21 @@ def calculate_prediction(
         )
 
         status.write("匹配个人能力并计算逐段时间……")
-        prediction = predict_race(profile, segments, aid_minutes, condition=condition,
-                                  simulations=simulations, gpx_quality_score=float(gpx_quality["score"]))
+        try:
+            prediction = predict_race(profile, segments, aid_minutes, condition=condition,
+                                      simulations=simulations, gpx_quality_score=float(gpx_quality["score"]))
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise AnalysisStageError("逐段概率预测", exc) from exc
         prediction["gpx_data_quality"] = gpx_quality
         completed += 1
         progress.progress(completed / total_steps, text="逐段预测已完成")
 
-        report = build_markdown_report(profile, prediction)
+        try:
+            report = build_markdown_report(profile, prediction)
+        except Exception as exc:
+            raise AnalysisStageError("报告生成", exc) from exc
         completed += 1
         progress.progress(1.0, text="报告生成完成")
         status.update(label="计算完成", state="complete", expanded=False)
@@ -590,9 +617,15 @@ def render_result(result: dict[str, Any]) -> None:
         ]
         st.dataframe(pd.DataFrame(environment_rows, columns=["项目", "结果"]), hide_index=True, width="stretch")
         physiology = prediction.get("physiology", {})
+        schedule = physiology.get("race_temperature_schedule", {})
+        schedule_text = (
+            "未填写" if schedule.get("start_c") is None else
+            f"{float(schedule['start_c']):g}℃ → {float(schedule.get('peak_c') if schedule.get('peak_c') is not None else schedule['start_c']):g}℃"
+            f"（{float(schedule.get('peak_hour') or 0):g}h）→ {float(schedule.get('finish_c') if schedule.get('finish_c') is not None else schedule.get('peak_c') if schedule.get('peak_c') is not None else schedule['start_c']):g}℃"
+        )
         st.subheader("温度与心率响应")
         physiology_rows = [
-            ["比赛温度", "未填写" if physiology.get("race_temperature_c") is None else f"{float(physiology['race_temperature_c']):.1f}℃"],
+            ["比赛温度曲线", schedule_text],
             ["温度模型", f"{physiology.get('temperature_model_source', 'unavailable')} / {float(physiology.get('temperature_model_confidence', .2)):.0%}"],
             ["温度直接系数", f"×{float(physiology.get('direct_temperature_factor', 1)):.3f}"],
             ["最大温度疲劳系数", f"×{float(physiology.get('maximum_temperature_fatigue_factor', 1)):.3f}"],
@@ -918,7 +951,16 @@ with st.sidebar:
         index=0,
         help="根据历史心率—输出关系选择可持续强度；积极策略只在有可靠样本时提高配速。",
     )
-    temperature = st.number_input("温度（℃）", min_value=-20, max_value=60, value=20, step=1)
+    temperature = st.number_input("起跑温度（℃）", min_value=-20, max_value=60, value=20, step=1)
+    use_temperature_curve = st.checkbox("设置比赛全程温度变化", value=False)
+    if use_temperature_curve:
+        temperature_peak = st.number_input("最高温度（℃）", min_value=-20, max_value=60, value=max(20, int(temperature)), step=1)
+        temperature_peak_hour = st.number_input("最高温出现于赛后（小时）", min_value=0.0, max_value=48.0, value=4.0, step=0.5)
+        temperature_finish = st.number_input("预计终点温度（℃）", min_value=-20, max_value=60, value=int(temperature), step=1)
+    else:
+        temperature_peak = None
+        temperature_peak_hour = None
+        temperature_finish = None
     humidity = st.number_input("湿度（%）", min_value=0, max_value=100, value=60, step=5)
     technical_labels = {
         -4: "极低技术", -3: "明显更简单", -2: "更简单", -1: "略简单",
@@ -966,6 +1008,9 @@ with st.sidebar:
                 selected_activities, confirmed_types, gpx_file, float(sample_distance), float(aid_minutes),
                 RaceCondition(current_form=form_labels[current_form_label],
                               pacing_strategy=pacing_labels[pacing_label], temperature_c=float(temperature),
+                              temperature_peak_c=None if temperature_peak is None else float(temperature_peak),
+                              temperature_peak_hour=None if temperature_peak_hour is None else float(temperature_peak_hour),
+                              temperature_finish_c=None if temperature_finish is None else float(temperature_finish),
                               humidity_percent=float(humidity), altitude_factor=1.0,
                               terrain_technical_level=int(technical_level), mud_level=int(mud_level),
                               night_running_ratio=0.0,
@@ -976,10 +1021,11 @@ with st.sidebar:
         except ValueError as exc:
             st.session_state.pop("prediction_result", None)
             st.warning(str(exc))
-        except Exception:
+        except Exception as exc:
             st.session_state.pop("prediction_result", None)
             logger.exception("prediction failed")
-            st.error("分析过程中出现异常，请检查上传文件后重试。")
+            st.error(f"分析过程中出现异常：{exc}")
+            st.caption("请把上面这条完整错误信息发给开发者；后台日志仍保留完整调用堆栈。")
     if not can_calculate:
         st.caption("解析并确认至少一个 FIT，同时上传 GPX 后即可开始计算。")
 

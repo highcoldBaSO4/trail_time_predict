@@ -115,8 +115,15 @@ def _representative_points(frame: pd.DataFrame, config: dict[str, object]) -> li
         )
         if distance >= distance_threshold or elevation_change >= elevation_threshold:
             selected.append(point)
-    if not selected[-1].equals(points.iloc[-1]):
-        selected.append(points.iloc[-1])
+    final = points.iloc[-1]
+    last = selected[-1]
+    final_distance = _haversine_m(last["latitude"], last["longitude"], final["latitude"], final["longitude"])
+    final_elevation_change = (
+        abs(float(final["elevation"]) - float(last["elevation"]))
+        if pd.notna(final["elevation"]) and pd.notna(last["elevation"]) else 0.0
+    )
+    if final_distance > 1.0 or final_elevation_change >= elevation_threshold:
+        selected.append(final)
     maximum = int(config["maximum_representative_points"])
     if len(selected) > maximum:
         indices = np.linspace(0, len(selected) - 1, maximum).round().astype(int)

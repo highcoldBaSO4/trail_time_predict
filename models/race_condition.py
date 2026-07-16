@@ -9,6 +9,9 @@ class RaceCondition:
     current_form: str = "normal"
     pacing_strategy: str = "standard"
     temperature_c: float | None = None
+    temperature_peak_c: float | None = None
+    temperature_peak_hour: float | None = None
+    temperature_finish_c: float | None = None
     humidity_percent: float | None = None
     altitude_factor: float = 1.0
     terrain_technical_level: int = 0
@@ -28,6 +31,9 @@ class RaceCondition:
                 else "standard"
             ),
             temperature_c=self.temperature_c,
+            temperature_peak_c=self.temperature_peak_c,
+            temperature_peak_hour=None if self.temperature_peak_hour is None else max(0.0, self.temperature_peak_hour),
+            temperature_finish_c=self.temperature_finish_c,
             humidity_percent=None if self.humidity_percent is None else min(100.0, max(0.0, self.humidity_percent)),
             altitude_factor=max(0.8, min(1.5, self.altitude_factor)),
             terrain_technical_level=max(-4, min(4, int(self.terrain_technical_level))),

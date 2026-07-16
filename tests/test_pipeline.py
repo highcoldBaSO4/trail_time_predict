@@ -20,7 +20,12 @@ from analysis.data_quality import diagnose_fit, diagnose_gpx
 from analysis.downhill import interpolate_downhill_speed
 from analysis.environment import build_environment_profile, relative_altitude_factor, solar_elevation_degrees
 from analysis.fatigue import interpolate_fatigue
-from analysis.temperature import calibrate_activity_temperature, _stabilize_temperature_curve
+from analysis.temperature import (
+    calibrate_activity_temperature,
+    humidity_time_factor,
+    race_temperature_at_elapsed,
+    _stabilize_temperature_curve,
+)
 from analysis import weather
 from analysis.uphill import interpolate_uphill_vam
 from config import load_config
@@ -406,8 +411,8 @@ def test_profile_exposes_quality_confidence_and_continuous_curves() -> None:
     profile = build_runner_profile({"training.fit": synthetic_activity()})
     assert profile["schema_version"] == "0.3"
     assert 0 <= profile["flat"]["confidence"] <= 1
-    assert len(profile["uphill"]["curve"]) == 4
-    assert len(profile["downhill"]["curve"]) == 4
+    assert len(profile["uphill"]["curve"]) == 5
+    assert len(profile["downhill"]["curve"]) == 5
     assert {"flat", "uphill", "downhill"} <= set(profile["fatigue"])
     for terrain in ("flat", "uphill", "downhill"):
         anchor = profile["fatigue"][terrain][0]
@@ -438,8 +443,8 @@ def test_runner_profile_typed_model_upgrades_legacy_curves() -> None:
 
     upgraded = RunnerProfile.from_profile_dict(legacy).to_profile_dict()
 
-    assert len(upgraded["uphill"]["curve"]) == 4
-    assert len(upgraded["downhill"]["curve"]) == 4
+    assert len(upgraded["uphill"]["curve"]) == 5
+    assert len(upgraded["downhill"]["curve"]) == 5
     assert upgraded["fatigue"]["flat"][2]["factor"] == legacy["fatigue"]["5h"]
     assert upgraded["uphill"]["curve"][0]["source"] == "legacy"
     assert upgraded["schema_version"] == "0.3"
@@ -505,7 +510,8 @@ def test_v03_temperature_and_hr_fatigue_are_explainable() -> None:
         frame["altitude"] = 100.0
         frame["temperature"] = np.linspace(start_temperature, start_temperature + 4.0, len(frame))
         frame["heart_rate"] = np.linspace(140.0, 160.0, len(frame))
-    profile = build_runner_profile({"cool.fit": cool, "hot.fit": hot})
+    profile = build_runner_profile({"cool-a.fit": cool, "cool-b.fit": cool.copy(),
+                                    "hot-a.fit": hot, "hot-b.fit": hot.copy()})
     segments = [{"distance": 100000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
                  "type": "flat", "start_km": 0.0, "end_km": 100.0}]
 
@@ -521,6 +527,41 @@ def test_v03_temperature_and_hr_fatigue_are_explainable() -> None:
     assert "个人温度耐受" in report
     assert "心率响应与漂移" in report
     assert "高温后程疲劳" in report
+
+
+def test_humidity_penalty_activates_only_in_warm_conditions() -> None:
+    assert humidity_time_factor(15.0, 95.0) == pytest.approx(1.0)
+    assert humidity_time_factor(20.0, 95.0) == pytest.approx(1.0)
+    assert humidity_time_factor(25.0, 90.0) == pytest.approx(1.01)
+    assert humidity_time_factor(30.0, 90.0) == pytest.approx(1.02)
+
+
+def test_race_temperature_schedule_interpolates_start_peak_and_finish() -> None:
+    condition = RaceCondition(temperature_c=18.0, temperature_peak_c=32.0,
+                              temperature_peak_hour=4.0, temperature_finish_c=22.0)
+    assert race_temperature_at_elapsed(condition, 0.0, 10.0) == pytest.approx(18.0)
+    assert race_temperature_at_elapsed(condition, 2.0, 10.0) == pytest.approx(25.0)
+    assert race_temperature_at_elapsed(condition, 4.0, 10.0) == pytest.approx(32.0)
+    assert race_temperature_at_elapsed(condition, 10.0, 10.0) == pytest.approx(22.0)
+
+
+def test_prediction_applies_temperature_schedule_by_segment_time() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    segments = [
+        {"distance": 20000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0, "type": "flat",
+         "start_km": float(index * 20), "end_km": float((index + 1) * 20), "terrain": "平路"}
+        for index in range(2)
+    ]
+    prediction = predict_race(
+        profile, segments,
+        condition=RaceCondition(temperature_c=18.0, temperature_peak_c=32.0,
+                                temperature_peak_hour=2.0, temperature_finish_c=20.0,
+                                humidity_percent=85.0),
+        simulations=1000, seed=71,
+    )
+    temperatures = [float(row["physiology"]["temperature_c"]) for row in prediction["segments"]]
+    assert temperatures[0] != temperatures[1]
+    assert prediction["physiology"]["race_temperature_schedule"]["peak_c"] == 32.0
 
 
 def test_heart_rate_intensity_strategy_uses_historical_output_with_guards() -> None:

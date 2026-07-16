@@ -134,6 +134,8 @@ heart_rate_model:
   expected_drift_bpm_at_5h: 6.0
   default_heat_sensitivity_bpm_per_degree: 0.30
   maximum_heat_sensitivity_bpm_per_degree: 1.20
+  heat_sensitivity_max_elapsed_hours: 1.5
+  heat_sensitivity_minimum_temperature_span_c: 5.0
   heat_drift_time_factor_scale: 0.010
   maximum_heat_drift_time_factor: 1.08
 
@@ -144,6 +146,7 @@ temperature_model:
   comfort_max_c: 20.0
   wrist_relative:
     warmup_minutes: 30.0
+  direct_effect_max_elapsed_hours: 1.5
   nodes_c: [-5.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0]
   default_curve:
     - {temperature_c: -5.0, time_factor: 1.06}
@@ -160,12 +163,17 @@ temperature_model:
   node_evidence:
     minimum_activities: 2
     full_activities: 3
-    minimum_duration_minutes: 60.0
-    full_duration_minutes: 180.0
+    minimum_duration_minutes: 30.0
+    full_duration_minutes: 90.0
   maximum_personal_factor_adjustment: 0.05
   fatigue_threshold_above_reference_c: 5.0
   fatigue_time_increase_per_degree_hour: 0.0008
   maximum_fatigue_time_factor: 1.12
+  humidity_interaction:
+    activation_temperature_c: 20.0
+    full_effect_temperature_c: 30.0
+    threshold_percent: 70.0
+    per_percent_at_full_effect: 0.001
 
 monte_carlo:
   simulations: 3000

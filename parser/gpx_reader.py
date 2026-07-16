@@ -114,8 +114,8 @@ def route_summary(segments: list[dict[str, object]]) -> dict[str, float | int]:
         if bool(micro.get("elevation_available", False))
     ]
     if not elevations:
-        elevations = [float(item["elevation"]) for item in segments if bool(item.get("elevation_available", False))]
-    weighted_distance = sum(float(item["distance"]) for item in segments if bool(item.get("elevation_available", False)))
+        elevations = [float(item["elevation"]) for item in segments if bool(item.get("elevation_available", False)) and item.get("elevation") is not None]
+    weighted_distance = sum(float(item["distance"]) for item in segments if bool(item.get("elevation_available", False)) and item.get("elevation") is not None)
     return {
         "distance_km": round(sum(float(item["distance"]) for item in segments) / 1000.0, 3),
         "elevation_gain": round(sum(float(item["gain"]) for item in segments), 1),
@@ -124,7 +124,7 @@ def route_summary(segments: list[dict[str, object]]) -> dict[str, float | int]:
         "descents": sum(item["type"] == "downhill" for item in segments),
         "micro_segments": sum(len(list(item.get("micro_segments", []))) for item in segments),
         "average_elevation_m": round(
-            sum(float(item["elevation"]) * float(item["distance"]) for item in segments if bool(item.get("elevation_available", False)))
+            sum(float(item["elevation"]) * float(item["distance"]) for item in segments if bool(item.get("elevation_available", False)) and item.get("elevation") is not None)
             / weighted_distance,
             1,
         ) if weighted_distance > 0 else None,

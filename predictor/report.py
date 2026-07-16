@@ -256,7 +256,7 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         f"- 比赛预计夜间占比：{float(race_environment.get('race_night_ratio', 0)):.1%}",
         f"- 比赛平均海拔：{_format_elevation(race_environment.get('race_average_elevation_m'))}",
         f"- 比赛最高海拔：{_format_elevation(race_environment.get('race_maximum_elevation_m'))}",
-        f"- 比赛温度：{_temperature_value(physiology.get('race_temperature_c'))}",
+        f"- 比赛温度曲线：{_temperature_schedule_text(physiology.get('race_temperature_schedule', {}))}",
         f"- 温度模型：{_source_label(physiology.get('temperature_model_source'))}，"
         f"可信度 {float(physiology.get('temperature_model_confidence', 0.2)):.0%}",
         f"- 温度直接耗时系数：×{float(physiology.get('direct_temperature_factor', 1)):.3f}",
@@ -424,6 +424,21 @@ def _source_label(value: object) -> str:
 
 def _temperature_value(value: object) -> str:
     return "未填写" if value is None else f"{float(value):.1f}℃"
+
+
+def _temperature_schedule_text(value: object) -> str:
+    if not isinstance(value, dict) or value.get("start_c") is None:
+        return "未填写"
+    start = float(value["start_c"])
+    peak = value.get("peak_c")
+    finish = value.get("finish_c")
+    peak_hour = value.get("peak_hour")
+    if peak is None and finish is None:
+        return f"全程按 {start:.1f}℃"
+    peak = start if peak is None else float(peak)
+    finish = peak if finish is None else float(finish)
+    when = "中途" if peak_hour is None else f"赛后 {float(peak_hour):g}h"
+    return f"起跑 {start:.1f}℃ → {when} {peak:.1f}℃ → 终点 {finish:.1f}℃"
 
 
 def _temperature_range(value: object) -> str:

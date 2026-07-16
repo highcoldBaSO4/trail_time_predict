@@ -12,6 +12,8 @@ from analysis.uphill import interpolate_uphill_vam
 from analysis.heart_rate import heart_rate_pacing_adjustment, interpolate_hr_drift
 from analysis.temperature import (
     heart_rate_heat_fatigue_time_factor,
+    humidity_time_factor,
+    race_temperature_at_elapsed,
     temperature_fatigue_time_factor,
     temperature_time_factor,
 )
@@ -134,15 +136,20 @@ def _predict_once(
             profile, segment, condition, elapsed, standard_seconds, apply_environment
         )
         physiology_elapsed_hours = (elapsed + standard_seconds / 2.0) / 3600.0
+        segment_temperature = race_temperature_at_elapsed(
+            condition, physiology_elapsed_hours, estimated_hours
+        ) if apply_environment else None
         direct_temperature = (
-            temperature_time_factor(profile, condition.temperature_c) if apply_environment else 1.0
+            temperature_time_factor(profile, segment_temperature)
+            * humidity_time_factor(segment_temperature, condition.humidity_percent)
+            if apply_environment else 1.0
         )
         temperature_fatigue = (
-            temperature_fatigue_time_factor(profile, condition.temperature_c, physiology_elapsed_hours)
+            temperature_fatigue_time_factor(profile, segment_temperature, physiology_elapsed_hours)
             if apply_environment else 1.0
         )
         heart_rate_fatigue = (
-            heart_rate_heat_fatigue_time_factor(profile, condition.temperature_c, physiology_elapsed_hours)
+            heart_rate_heat_fatigue_time_factor(profile, segment_temperature, physiology_elapsed_hours)
             if apply_environment else 1.0
         )
         factors = condition_factors(
@@ -190,7 +197,7 @@ def _predict_once(
                      "condition_increase_seconds": {key: round(value, 1) for key, value in factor_increases.items()},
                      "environment": environment,
                      "physiology": {
-                         "temperature_c": condition.temperature_c,
+                         "temperature_c": segment_temperature,
                          "temperature_direct_factor": round(direct_temperature, 4),
                          "temperature_fatigue_factor": round(temperature_fatigue, 4),
                          "heart_rate_fatigue_factor": round(heart_rate_fatigue, 4),
@@ -437,6 +444,12 @@ def _physiology_summary(
     heart_rate = profile.get("heart_rate", {})
     return {
         "race_temperature_c": condition.temperature_c,
+        "race_temperature_schedule": {
+            "start_c": condition.temperature_c,
+            "peak_c": condition.temperature_peak_c,
+            "peak_hour": condition.temperature_peak_hour,
+            "finish_c": condition.temperature_finish_c,
+        },
         "temperature_model_source": str(temperature.get("source", "unavailable")),
         "temperature_model_confidence": float(temperature.get("confidence", 0.2)),
         "reference_temperature_c": temperature.get("reference_temperature_c"),

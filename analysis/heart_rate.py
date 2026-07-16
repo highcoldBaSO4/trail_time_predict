@@ -480,17 +480,26 @@ def _normalize_output_by_grade(frame: pd.DataFrame) -> pd.DataFrame:
 def _heat_sensitivity(frame: pd.DataFrame) -> dict[str, object]:
     config = load_config()["heart_rate_model"]
     valid = frame[frame["temperature"].between(-30.0, 60.0)].copy()
+    # Use only early-race samples so ordinary cardiac drift is not learned as
+    # temperature sensitivity.
+    valid = valid[valid["elapsed_h"] <= float(config["heat_sensitivity_max_elapsed_hours"])].copy()
     activity_count = int(valid["activity"].nunique()) if not valid.empty else 0
-    if valid.empty or activity_count < 2 or float(valid["temperature"].max() - valid["temperature"].min()) < 5.0:
+    if valid.empty or activity_count < 2 or float(valid["temperature"].max() - valid["temperature"].min()) < float(config["heat_sensitivity_minimum_temperature_span_c"]):
         return {
             "bpm_per_degree": float(config["default_heat_sensitivity_bpm_per_degree"]),
             "source": "default",
             "confidence": 0.2,
             "activity_count": activity_count,
         }
-    group = valid.groupby(["activity", "grade_band"])
-    valid["hr_residual"] = valid["heart_rate"] - group["heart_rate"].transform("median")
-    valid["temperature_residual"] = valid["temperature"] - group["temperature"].transform("median")
+    # Normalize output within comparable grade bands before relating heart
+    # rate cost to temperature. This preserves between-activity cold/hot
+    # evidence while reducing differences caused by pace and slope.
+    grade_output = valid.groupby("grade_band")["output"].transform("median").clip(lower=1e-6)
+    valid["normalized_output"] = (valid["output"] / grade_output).clip(0.5, 1.5)
+    valid["effort_hr"] = valid["heart_rate"] / valid["normalized_output"]
+    grade_group = valid.groupby("grade_band")
+    valid["hr_residual"] = valid["effort_hr"] - grade_group["effort_hr"].transform("median")
+    valid["temperature_residual"] = valid["temperature"] - grade_group["temperature"].transform("median")
     heat_weights = valid.get("temperature_weight_seconds", valid["weight_seconds"])
     variance = float(np.average(valid["temperature_residual"] ** 2, weights=heat_weights))
     covariance = float(np.average(valid["temperature_residual"] * valid["hr_residual"], weights=heat_weights))

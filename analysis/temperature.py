@@ -178,6 +178,40 @@ def temperature_time_factor(profile: dict[str, object], temperature_c: float | N
     return float(np.interp(float(temperature_c), [item[0] for item in ordered], [item[1] for item in ordered]))
 
 
+def humidity_time_factor(temperature_c: float | None, humidity_percent: float | None) -> float:
+    """Return a humidity penalty that activates only in warm conditions."""
+    if temperature_c is None or humidity_percent is None:
+        return 1.0
+    config = load_config()["temperature_model"]["humidity_interaction"]
+    activation = float(config["activation_temperature_c"])
+    full_effect = max(activation + 0.1, float(config["full_effect_temperature_c"]))
+    heat_activation = float(np.clip((float(temperature_c) - activation) / (full_effect - activation), 0.0, 1.0))
+    humidity_excess = max(0.0, float(humidity_percent) - float(config["threshold_percent"]))
+    return 1.0 + heat_activation * humidity_excess * float(config["per_percent_at_full_effect"])
+
+
+def race_temperature_at_elapsed(condition: object, elapsed_hours: float, estimated_hours: float) -> float | None:
+    """Interpolate start, peak and finish temperatures over race time."""
+    start = getattr(condition, "temperature_c", None)
+    if start is None:
+        return None
+    peak_value = getattr(condition, "temperature_peak_c", None)
+    finish_value = getattr(condition, "temperature_finish_c", None)
+    peak_hour_value = getattr(condition, "temperature_peak_hour", None)
+    if peak_value is None and finish_value is None:
+        return float(start)
+    peak = float(start if peak_value is None else peak_value)
+    finish = float(peak if finish_value is None else finish_value)
+    total = max(0.01, float(estimated_hours))
+    peak_at = min(total, max(0.0, float(total / 2.0 if peak_hour_value is None else peak_hour_value)))
+    elapsed = min(total, max(0.0, float(elapsed_hours)))
+    if elapsed <= peak_at and peak_at > 0:
+        return float(np.interp(elapsed, [0.0, peak_at], [float(start), peak]))
+    if peak_at >= total:
+        return peak
+    return float(np.interp(elapsed, [peak_at, total], [peak, finish]))
+
+
 def temperature_fatigue_time_factor(
     profile: dict[str, object], temperature_c: float | None, elapsed_hours: float
 ) -> float:
@@ -254,6 +288,11 @@ def _prepare_samples(activity: pd.DataFrame, fatigue_profile: dict[str, object])
     data["elapsed_h"] = (
         pd.to_datetime(data["timestamp"], errors="coerce", utc=True) - start
     ).dt.total_seconds().clip(lower=0) / 3600.0
+    # Estimate the immediate temperature response from the paced opening
+    # portion only. Later deterioration is modelled as cumulative heat fatigue.
+    data = data[data["elapsed_h"] <= float(config["direct_effect_max_elapsed_hours"])].copy()
+    if data.empty:
+        return data
     data["retention"] = [
         interpolate_fatigue(float(hour), fatigue_profile.get(str(terrain), []))
         for hour, terrain in zip(data["elapsed_h"], data["terrain"])

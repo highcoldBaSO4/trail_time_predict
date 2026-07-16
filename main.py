@@ -69,6 +69,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--current-form", choices=["very_good", "normal", "slight_fatigue", "poor", "ill_or_injured"], default="normal", help="当前身体状态")
     parser.add_argument("--pacing-strategy", choices=["conservative", "standard", "aggressive"], default="standard", help="比赛强度策略")
     parser.add_argument("--temperature", type=float, default=None, help="比赛温度（摄氏度）")
+    parser.add_argument("--temperature-peak", type=float, default=None, help="比赛最高温度（摄氏度）")
+    parser.add_argument("--temperature-peak-hour", type=float, default=None, help="最高温出现于赛后第几小时")
+    parser.add_argument("--temperature-finish", type=float, default=None, help="预计终点温度（摄氏度）")
     parser.add_argument("--humidity", type=float, default=None, help="相对湿度百分比")
     parser.add_argument("--technical-level", type=int, choices=range(-4, 5), default=0, help="相对平时的技术难度 -4 至 4")
     parser.add_argument("--mud-level", type=int, choices=range(-4, 5), default=0, help="相对平时的泥泞程度 -4 至 4")
@@ -104,6 +107,9 @@ if __name__ == "__main__":
         args.aid_minutes,
         condition=RaceCondition(current_form=args.current_form, pacing_strategy=args.pacing_strategy,
                                 temperature_c=args.temperature,
+                                temperature_peak_c=args.temperature_peak,
+                                temperature_peak_hour=args.temperature_peak_hour,
+                                temperature_finish_c=args.temperature_finish,
                                 humidity_percent=args.humidity, altitude_factor=args.altitude_factor,
                                 terrain_technical_level=args.technical_level, mud_level=args.mud_level,
                                 night_running_ratio=args.night_ratio, carried_weight_kg=args.carried_weight,

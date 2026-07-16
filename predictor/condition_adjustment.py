@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from config import load_config
 from models import RaceCondition
+from analysis.temperature import humidity_time_factor
 
 
 def condition_factors(
@@ -31,8 +32,7 @@ def condition_factors(
     heat = float(temperature_factor) if temperature_factor is not None else 1.0
     if temperature_factor is None and condition.temperature_c is not None:
         heat += max(0.0, condition.temperature_c - float(heat_config["threshold_c"])) * float(heat_config["per_degree"])
-    if condition.humidity_percent is not None:
-        heat *= 1.0 + max(0.0, condition.humidity_percent - float(heat_config["humidity_threshold_percent"])) * float(heat_config["humidity_per_percent"])
+        heat *= humidity_time_factor(condition.temperature_c, condition.humidity_percent)
     return {
         "form": float(form_entry["factor"]),
         "technical": technical,
