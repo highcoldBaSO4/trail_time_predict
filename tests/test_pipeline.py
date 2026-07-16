@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import sys
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -327,6 +328,9 @@ def test_phase2_prediction_conditions_and_probability_order() -> None:
     assert difficult["optimistic_time_seconds"] <= difficult["median_finish_time_seconds"] <= difficult["conservative_time_seconds"]
     assert difficult["adjustment_breakdown"]["technical"] > 0
     assert difficult["aid_station_time_seconds"] == 600
+    report = build_markdown_report(profile, difficult)
+    assert "概率区间依据" in report
+    assert "疲劳可信度" in report
 
 
 def test_phase2_monte_carlo_is_reproducible() -> None:
@@ -336,6 +340,58 @@ def test_phase2_monte_carlo_is_reproducible() -> None:
     first = predict_race(profile, segments, simulations=1000, seed=99)
     second = predict_race(profile, segments, simulations=1000, seed=99)
     assert first["probability"] == second["probability"]
+    assert first["probability"]["method"] == "segmented_terrain_fatigue"
+    assert set(first["probability"]["uncertainty"]["ability_confidence"]) == {"flat", "uphill", "downhill"}
+
+
+def test_segmented_probability_reflects_route_terrain_confidence() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    profile["flat"]["confidence"] = 0.95
+    for point in profile["uphill"]["curve"]:
+        point["confidence"] = 0.2
+    for point in profile["downhill"]["curve"]:
+        point["confidence"] = 0.95
+    for layer in profile["duration_capabilities"]:
+        layer["terrain_confidence"] = {terrain: 0.95 for terrain in ("flat", "uphill", "downhill")}
+    for terrain in ("flat", "uphill", "downhill"):
+        for point in profile["fatigue"][terrain]:
+            if point["confidence"] is not None:
+                point["confidence"] = 0.95
+
+    flat_segments = [{"distance": 1000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
+                      "type": "flat", "start_km": 0.0, "end_km": 1.0}]
+    uphill_segments = [{"distance": 1000.0, "gain": 100.0, "loss": 0.0, "grade": 10.0,
+                        "type": "uphill", "start_km": 0.0, "end_km": 1.0}]
+    flat_prediction = predict_race(profile, flat_segments, simulations=3000, seed=31)
+    uphill_prediction = predict_race(profile, uphill_segments, simulations=3000, seed=31)
+
+    assert flat_prediction["probability"]["uncertainty"]["terrain_time_share"]["flat"] == 1.0
+    assert uphill_prediction["probability"]["uncertainty"]["terrain_time_share"]["uphill"] == 1.0
+    assert uphill_prediction["probability"]["sigma"] > flat_prediction["probability"]["sigma"]
+
+
+def test_segmented_probability_samples_uphill_fatigue_separately() -> None:
+    high_confidence = build_runner_profile({"training.fit": synthetic_activity()})
+    low_confidence = deepcopy(high_confidence)
+    for profile, confidence in ((high_confidence, 0.95), (low_confidence, 0.2)):
+        for point in profile["uphill"]["curve"]:
+            point["confidence"] = 0.95
+        for layer in profile["duration_capabilities"]:
+            layer["terrain_confidence"] = {terrain: 0.95 for terrain in ("flat", "uphill", "downhill")}
+        for terrain in ("flat", "uphill", "downhill"):
+            for point in profile["fatigue"][terrain]:
+                if point["confidence"] is not None:
+                    point["confidence"] = confidence if terrain == "uphill" else 0.95
+    segments = [
+        {"distance": 5000.0, "gain": 500.0, "loss": 0.0, "grade": 10.0,
+         "type": "uphill", "start_km": index * 5.0, "end_km": (index + 1) * 5.0}
+        for index in range(8)
+    ]
+    stable = predict_race(high_confidence, segments, simulations=3000, seed=37)
+    uncertain = predict_race(low_confidence, segments, simulations=3000, seed=37)
+
+    assert uncertain["probability"]["sigma"] > stable["probability"]["sigma"]
+    assert uncertain["probability"]["uncertainty"]["fatigue_confidence"]["uphill"][2] == 0.2
 
 
 def test_race_automatically_applies_night_and_altitude_by_segment() -> None:

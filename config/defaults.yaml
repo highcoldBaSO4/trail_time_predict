@@ -98,3 +98,6 @@ monte_carlo:
   condition_sigma: 0.02
   gpx_sigma_high_quality: 0.01
   gpx_sigma_low_quality: 0.06
+  terrain_correlation: 0.70
+  fatigue_sigma_scale: 0.60
+  duration_sigma_scale: 0.50

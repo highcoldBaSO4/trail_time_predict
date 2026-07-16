@@ -149,7 +149,26 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         weights = "、".join(f"{name} {float(weight):.0%}" for name, weight in match.get("weights", {}).items()) or "—"
         duration_rows.append(f"| {terrain_labels[terrain]} | {weights} | ×{float(match.get('factor', 1)):.3f} | {float(match.get('confidence', .2)):.0%} | {match.get('source', 'legacy')} |")
     insertion = lines.index("## 分段预测")
-    lines[insertion:insertion] = duration_rows + ["", "### 时间损耗拆解", "", "| 项目 | 时间影响 |", "| --- | ---: |"] + [
+    probability_uncertainty = prediction.get("probability", {}).get("uncertainty", {})
+    probability_rows = []
+    terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
+    for terrain in ("flat", "uphill", "downhill"):
+        probability_rows.append(
+            f"| {terrain_labels[terrain]} | "
+            f"{float(probability_uncertainty.get('terrain_time_share', {}).get(terrain, 0)):.1%} | "
+            f"{_mean_confidence(probability_uncertainty.get('ability_confidence', {}).get(terrain, 0.2)):.0%} | "
+            f"{_mean_confidence(probability_uncertainty.get('fatigue_confidence', {}).get(terrain, [])):.0%} | "
+            f"{float(probability_uncertainty.get('duration_confidence', {}).get(terrain, 0.2)):.0%} |"
+        )
+    lines[insertion:insertion] = duration_rows + [
+        "",
+        "### 概率区间依据",
+        "",
+        "Monte Carlo 按分地形能力和分地形疲劳曲线逐段重算；同一场模拟内同类能力保持相关。",
+        "",
+        "| 地形 | 预计耗时占比 | 能力可信度 | 疲劳可信度 | 持续能力可信度 |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ] + probability_rows + ["", "### 时间损耗拆解", "", "| 项目 | 时间影响 |", "| --- | ---: |"] + [
         f"| {_breakdown_label(key)} | {format_duration(float(value))} |" for key, value in prediction.get("adjustment_breakdown", {}).items()
     ] + [""]
     for row in prediction["segments"]:
@@ -205,3 +224,9 @@ def _fatigue_row(time_range: str, retained_ratio: float) -> str:
 
 def _format_elevation(value: object) -> str:
     return "—" if value is None else f"{float(value):.0f} m"
+
+
+def _mean_confidence(value: object) -> float:
+    values = value if isinstance(value, list) else [value]
+    numeric = [float(item) for item in values if item is not None]
+    return sum(numeric) / len(numeric) if numeric else 0.2

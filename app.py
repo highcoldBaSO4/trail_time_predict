@@ -316,6 +316,12 @@ def _sample_pace(sample: dict[str, Any], fallback_speed: float | None = None) ->
     return f"{format_pace(1000 / fallback_speed)}/km" if fallback_speed else "—"
 
 
+def _mean_confidence(value: Any) -> float:
+    values = value if isinstance(value, list) else [value]
+    numeric = [float(item) for item in values if item is not None]
+    return sum(numeric) / len(numeric) if numeric else 0.2
+
+
 def render_result(result: dict[str, Any]) -> None:
     prediction = result["prediction"]
     profile = result["profile"]
@@ -392,6 +398,29 @@ def render_result(result: dict[str, Any]) -> None:
                                           float(prediction["conservative_time_seconds"]))
         st.pyplot(distribution, width="stretch")
         plt.close(distribution)
+        uncertainty = prediction["probability"].get("uncertainty", {})
+        if uncertainty:
+            st.subheader("概率区间依据")
+            terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
+            uncertainty_rows = []
+            for terrain in ("flat", "uphill", "downhill"):
+                uncertainty_rows.append(
+                    [
+                        terrain_labels[terrain],
+                        f"{float(uncertainty.get('terrain_time_share', {}).get(terrain, 0)):.1%}",
+                        f"{_mean_confidence(uncertainty.get('ability_confidence', {}).get(terrain, 0.2)):.0%}",
+                        f"{_mean_confidence(uncertainty.get('fatigue_confidence', {}).get(terrain, [])):.0%}",
+                        f"{float(uncertainty.get('duration_confidence', {}).get(terrain, 0.2)):.0%}",
+                    ]
+                )
+            st.dataframe(
+                pd.DataFrame(
+                    uncertainty_rows,
+                    columns=["地形", "预计耗时占比", "能力可信度", "疲劳可信度", "持续能力可信度"],
+                ),
+                hide_index=True,
+                width="stretch",
+            )
         st.subheader("时间损耗拆解")
         labels = {"base_terrain": "基础地形", "duration_adaptation": "目标时长适配", "fatigue": "疲劳",
                   "form": "当前状态", "technical": "技术难度", "mud": "泥泞", "night": "夜间",

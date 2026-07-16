@@ -14,7 +14,7 @@ from models import PredictionResult, RaceCondition, RunnerProfile
 from parser.gpx_reader import route_summary
 from predictor.condition_adjustment import condition_factors
 from predictor.duration_adjustment import duration_match
-from predictor.probability import simulate_finish_times
+from predictor.probability import simulate_segmented_finish_times
 
 
 def predict_race(
@@ -53,7 +53,9 @@ def predict_race(
     adjusted_rows, adjusted_seconds, breakdown = _predict_once(profile, segments, estimate_hours, race_condition)
     aid_seconds = race_condition.aid_station_minutes * 60.0
     confidence = _prediction_confidence(profile, adjusted_rows)
-    probability = simulate_finish_times(adjusted_seconds, aid_seconds, confidence, gpx_quality_score, simulations, seed)
+    probability = simulate_segmented_finish_times(
+        profile, adjusted_rows, aid_seconds, gpx_quality_score, simulations, seed
+    )
     risks = _risk_notes(profile, adjusted_rows, gpx_quality_score, converged)
     environment_summary = _environment_summary(profile, adjusted_rows)
 
