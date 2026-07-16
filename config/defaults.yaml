@@ -95,9 +95,21 @@ monte_carlo:
   seed: 2026
   sigma_at_confidence_zero: 0.16
   sigma_at_confidence_one: 0.025
+  # Compatibility fallback for the aggregate probability API.
   condition_sigma: 0.02
+  condition_activation_reference: 0.10
+  condition_terrain_correlation: 0.85
+  condition_source_sigma:
+    form: 0.025
+    technical: 0.035
+    mud: 0.040
+    night: 0.030
+    altitude: 0.030
+    carried_weight: 0.025
+    weather: 0.035
   gpx_sigma_high_quality: 0.01
   gpx_sigma_low_quality: 0.06
+  gpx_segment_correlation: 0.55
   terrain_correlation: 0.70
   fatigue_sigma_scale: 0.60
   duration_sigma_scale: 0.50

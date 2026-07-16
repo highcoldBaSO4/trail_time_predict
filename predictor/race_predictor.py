@@ -52,10 +52,12 @@ def predict_race(
 
     adjusted_rows, adjusted_seconds, breakdown = _predict_once(profile, segments, estimate_hours, race_condition)
     aid_seconds = race_condition.aid_station_minutes * 60.0
-    confidence = _prediction_confidence(profile, adjusted_rows)
+    confidence_details = _prediction_confidence_details(profile, adjusted_rows, gpx_quality_score)
+    confidence = float(confidence_details["overall"])
     probability = simulate_segmented_finish_times(
         profile, adjusted_rows, aid_seconds, gpx_quality_score, simulations, seed
     )
+    probability.setdefault("uncertainty", {})["route_weighted_confidence"] = confidence_details
     risks = _risk_notes(profile, adjusted_rows, gpx_quality_score, converged)
     environment_summary = _environment_summary(profile, adjusted_rows)
 
@@ -187,20 +189,99 @@ def _initial_estimate_hours(profile: dict[str, object], segments: list[dict[str,
     return max(0.1, sum(_base_segment_seconds(profile, segment)[0] for segment in segments) / 3600.0)
 
 
-def _prediction_confidence(profile: dict[str, object], rows: list[dict[str, object]]) -> float:
-    values = [float(profile.get("flat", {}).get("confidence", 0.2))]
-    values.extend(float(point.get("confidence", 0.2)) for point in profile.get("uphill", {}).get("curve", []))
-    values.extend(float(point.get("confidence", 0.2)) for point in profile.get("downhill", {}).get("curve", []))
-    values.extend(float(row.get("duration_confidence", 0.2)) for row in rows)
-    values.append(float(profile.get("data_quality", {}).get("score", 0.2)))
-    confidence = sum(values) / len(values)
+def _prediction_confidence(
+    profile: dict[str, object], rows: list[dict[str, object]], gpx_quality_score: float = 1.0
+) -> float:
+    return float(_prediction_confidence_details(profile, rows, gpx_quality_score)["overall"])
+
+
+def _prediction_confidence_details(
+    profile: dict[str, object], rows: list[dict[str, object]], gpx_quality_score: float = 1.0
+) -> dict[str, object]:
+    total_seconds = sum(float(row.get("predicted_time_seconds", 0.0)) for row in rows)
+    terrain_totals = {terrain: 0.0 for terrain in ("flat", "uphill", "downhill")}
+    terrain_weighted = {
+        terrain: {"ability": 0.0, "fatigue": 0.0, "duration": 0.0, "combined": 0.0}
+        for terrain in terrain_totals
+    }
+    route_weighted = 0.0
+    for row in rows:
+        terrain = str(row.get("type", "flat"))
+        seconds = float(row.get("predicted_time_seconds", 0.0))
+        ability = _ability_confidence_for_grade(profile, terrain, float(row.get("grade", 0.0)))
+        fatigue = _fatigue_confidence_for_terrain(profile, terrain)
+        duration = float(row.get("duration_confidence", 0.2))
+        combined = ability * 0.50 + fatigue * 0.25 + duration * 0.25
+        terrain_totals[terrain] += seconds
+        terrain_weighted[terrain]["ability"] += seconds * ability
+        terrain_weighted[terrain]["fatigue"] += seconds * fatigue
+        terrain_weighted[terrain]["duration"] += seconds * duration
+        terrain_weighted[terrain]["combined"] += seconds * combined
+        route_weighted += seconds * combined
+
+    route_capability = route_weighted / total_seconds if total_seconds > 0 else 0.2
+    data_quality = float(profile.get("data_quality", {}).get("score", 0.2))
+    confidence = route_capability * 0.85 + data_quality * 0.15
+    altitude_penalty = 0.0
     altitude_profile = profile.get("environment", {}).get("altitude", {})
     historical_p90 = float(altitude_profile.get("p90_m", 0.0))
     route_max = max((float(row.get("environment", {}).get("elevation_m", 0.0)) for row in rows), default=0.0)
     environment_config = load_config()["environment"]["altitude"]
     if route_max > historical_p90 + float(environment_config["coverage_margin_m"]):
-        confidence -= float(environment_config["confidence_penalty"])
-    return max(0.2, min(0.95, confidence))
+        altitude_penalty = float(environment_config["confidence_penalty"])
+        confidence -= altitude_penalty
+    gpx_quality = max(0.0, min(1.0, float(gpx_quality_score)))
+    confidence = confidence * 0.90 + gpx_quality * 0.10
+
+    terrain_details: dict[str, dict[str, float]] = {}
+    for terrain, seconds in terrain_totals.items():
+        terrain_details[terrain] = {
+            "time_share": round(seconds / total_seconds, 4) if total_seconds > 0 else 0.0,
+            **{
+                key: round(value / seconds, 3) if seconds > 0 else 0.0
+                for key, value in terrain_weighted[terrain].items()
+            },
+        }
+    return {
+        "overall": round(max(0.2, min(0.95, confidence)), 3),
+        "route_capability": round(route_capability, 3),
+        "data_quality": round(data_quality, 3),
+        "gpx_quality": round(gpx_quality, 3),
+        "altitude_penalty": round(altitude_penalty, 3),
+        "terrain": terrain_details,
+    }
+
+
+def _ability_confidence_for_grade(profile: dict[str, object], terrain: str, grade: float) -> float:
+    if terrain == "flat":
+        return float(profile.get("flat", {}).get("confidence", 0.2))
+    curve = sorted(
+        list(profile.get(terrain, {}).get("curve", [])), key=lambda point: float(point["grade"])
+    )
+    if not curve:
+        return 0.2
+    if grade <= float(curve[0]["grade"]):
+        return float(curve[0].get("confidence", 0.2) or 0.2)
+    if grade >= float(curve[-1]["grade"]):
+        return float(curve[-1].get("confidence", 0.2) or 0.2)
+    for lower, upper in zip(curve, curve[1:]):
+        lower_grade = float(lower["grade"])
+        upper_grade = float(upper["grade"])
+        if lower_grade <= grade <= upper_grade:
+            weight = (grade - lower_grade) / max(upper_grade - lower_grade, 1e-9)
+            lower_confidence = float(lower.get("confidence", 0.2) or 0.2)
+            upper_confidence = float(upper.get("confidence", 0.2) or 0.2)
+            return lower_confidence * (1.0 - weight) + upper_confidence * weight
+    return 0.2
+
+
+def _fatigue_confidence_for_terrain(profile: dict[str, object], terrain: str) -> float:
+    values = [
+        float(point["confidence"])
+        for point in profile.get("fatigue", {}).get(terrain, [])
+        if point.get("confidence") is not None
+    ]
+    return sum(values) / len(values) if values else 0.2
 
 
 def _risk_notes(profile: dict[str, object], rows: list[dict[str, object]], gpx_quality: float, converged: bool) -> list[str]:

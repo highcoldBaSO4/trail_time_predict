@@ -8,6 +8,7 @@ from config import load_config
 
 
 TERRAINS = ("flat", "uphill", "downhill")
+CONDITION_SOURCES = ("form", "technical", "mud", "night", "altitude", "carried_weight", "weather")
 
 
 def simulate_segmented_finish_times(
@@ -35,20 +36,24 @@ def simulate_segmented_finish_times(
     duration_samples, duration_confidence = _duration_samples(
         segment_rows, count, rng, config, duration_scale
     )
-    condition_noise = rng.lognormal(0.0, float(config["condition_sigma"]), count)
+    condition_latents = _condition_latents(count, rng, config)
+    condition_summary = _condition_uncertainty_summary(segment_rows, config)
     gpx_sigma = _gpx_sigma(gpx_quality_score, config)
-    gpx_noise = rng.lognormal(0.0, gpx_sigma, count)
+    gpx_shared = rng.normal(size=count)
+    gpx_correlation = float(config.get("gpx_segment_correlation", 0.55))
 
     elapsed = np.zeros(count, dtype=float)
     terrain_seconds = {terrain: 0.0 for terrain in TERRAINS}
+    gpx_affected_seconds = 0.0
     for row in segment_rows:
         terrain = str(row.get("type", "flat"))
-        raw_seconds = float(row["base_time_seconds"])
         deterministic_duration = float(row.get("duration_factor", 1.0))
         deterministic_condition = float(row.get("condition_factor", 1.0))
-        grade = float(row.get("grade", 0.0))
+        raw_seconds, sampled_grade = _sample_gpx_geometry(
+            profile, row, count, rng, gpx_shared, gpx_sigma, gpx_correlation
+        )
 
-        ability_time_factor = _ability_factor_for_grade(ability_samples[terrain], grade)
+        ability_time_factor = _ability_factor_for_grade(ability_samples[terrain], sampled_grade)
         sustainable = (
             raw_seconds
             * ability_time_factor
@@ -60,15 +65,19 @@ def simulate_segmented_finish_times(
             fatigue_samples[terrain]["hours"],
             fatigue_samples[terrain]["values"],
         )
+        condition_uncertainty = _condition_noise_for_row(
+            row, terrain, condition_latents, config
+        )
         seconds = (
             sustainable
             / np.maximum(fatigue, 0.1)
             * deterministic_condition
-            * condition_noise
-            * gpx_noise
+            * condition_uncertainty
         )
         elapsed += seconds
         terrain_seconds[terrain] += float(row["predicted_time_seconds"])
+        if terrain != "flat" and bool(row.get("elevation_available", True)):
+            gpx_affected_seconds += float(row["predicted_time_seconds"])
 
     samples = np.maximum(elapsed + max(0.0, float(aid_seconds)), 1.0)
     p10, p50, p90 = np.percentile(samples, [10, 50, 90])
@@ -84,14 +93,22 @@ def simulate_segmented_finish_times(
         "simulations": count,
         "sigma": round(float(np.std(samples) / np.mean(samples)), 4),
         "samples_seconds": [round(float(value), 1) for value in samples],
-        "method": "segmented_terrain_fatigue",
+        "method": "segmented_source_condition_physical_gpx",
         "uncertainty": {
             "terrain_time_share": terrain_share,
             "ability_confidence": ability_confidence,
             "fatigue_confidence": fatigue_confidence,
             "duration_confidence": duration_confidence,
-            "condition_sigma": float(config["condition_sigma"]),
+            "condition_sources": condition_summary,
+            "condition_sigma": round(_weighted_condition_sigma(condition_summary), 4),
             "gpx_sigma": round(gpx_sigma, 4),
+            "gpx": {
+                "mode": "segment_elevation_grade",
+                "quality_score": round(max(0.0, min(1.0, float(gpx_quality_score))), 3),
+                "vertical_sigma": round(gpx_sigma, 4),
+                "affected_time_share": round(gpx_affected_seconds / total_deterministic, 4)
+                if total_deterministic > 0 else 0.0,
+            },
         },
     }
 
@@ -142,7 +159,9 @@ def _ability_samples(
     }
     confidence_summary: dict[str, object] = {"flat": round(flat_confidence, 3)}
     for terrain, value_key in (("uphill", "value"), ("downhill", "speed_mps")):
-        curve = list(profile.get(terrain, {}).get("curve", []))
+        curve = sorted(
+            list(profile.get(terrain, {}).get("curve", [])), key=lambda point: float(point["grade"])
+        )
         grades = np.asarray([float(point["grade"]) for point in curve], dtype=float)
         confidences = np.asarray([float(point.get("confidence", 0.2) or 0.2) for point in curve])
         sigmas = np.asarray([_sigma_from_confidence(value, config) for value in confidences])
@@ -202,17 +221,135 @@ def _duration_samples(
     return result, confidence_summary
 
 
-def _ability_factor_for_grade(samples: dict[str, object], grade: float) -> np.ndarray:
+def _ability_factor_for_grade(samples: dict[str, object], grade: float | np.ndarray) -> np.ndarray:
     grades = np.asarray(samples["grades"], dtype=float)
     values = np.asarray(samples["values"], dtype=float)
-    if len(grades) == 1 or grade <= grades[0]:
+    if len(grades) == 1:
         return values[0]
-    if grade >= grades[-1]:
-        return values[-1]
-    upper = int(np.searchsorted(grades, grade))
+    grade_values = np.broadcast_to(np.asarray(grade, dtype=float), values.shape[1:])
+    upper = np.searchsorted(grades, grade_values, side="right")
+    upper = np.clip(upper, 1, len(grades) - 1)
     lower = upper - 1
-    weight = (grade - grades[lower]) / (grades[upper] - grades[lower])
-    return values[lower] * (1.0 - weight) + values[upper] * weight
+    weight = np.clip(
+        (grade_values - grades[lower]) / np.maximum(grades[upper] - grades[lower], 1e-9),
+        0.0,
+        1.0,
+    )
+    columns = np.arange(values.shape[1])
+    interpolated = values[lower, columns] * (1.0 - weight) + values[upper, columns] * weight
+    interpolated[grade_values <= grades[0]] = values[0, grade_values <= grades[0]]
+    interpolated[grade_values >= grades[-1]] = values[-1, grade_values >= grades[-1]]
+    return interpolated
+
+
+def _condition_latents(
+    count: int, rng: np.random.Generator, config: dict[str, Any]
+) -> dict[str, dict[str, np.ndarray]]:
+    correlation = max(0.0, min(1.0, float(config.get("condition_terrain_correlation", 0.85))))
+    result: dict[str, dict[str, np.ndarray]] = {}
+    for source in CONDITION_SOURCES:
+        shared = rng.normal(size=count)
+        independent = rng.normal(size=(len(TERRAINS), count))
+        result[source] = {
+            terrain: np.sqrt(correlation) * shared + np.sqrt(1.0 - correlation) * independent[index]
+            for index, terrain in enumerate(TERRAINS)
+        }
+    return result
+
+
+def _condition_noise_for_row(
+    row: dict[str, object],
+    terrain: str,
+    latents: dict[str, dict[str, np.ndarray]],
+    config: dict[str, Any],
+) -> np.ndarray:
+    factors = dict(row.get("condition_factors", {}))
+    sample = np.ones_like(next(iter(latents.values()))[terrain])
+    for source in CONDITION_SOURCES:
+        sigma = _condition_sigma_for_factor(source, float(factors.get(source, 1.0)), config)
+        if sigma > 0:
+            sample *= np.exp(sigma * latents[source][terrain])
+    return sample
+
+
+def _condition_sigma_for_factor(source: str, factor: float, config: dict[str, Any]) -> float:
+    source_sigmas = dict(config.get("condition_source_sigma", {}))
+    maximum = float(source_sigmas.get(source, config.get("condition_sigma", 0.02)))
+    reference = max(float(config.get("condition_activation_reference", 0.10)), 1e-6)
+    activation = min(abs(float(factor) - 1.0) / reference, 1.0)
+    return maximum * activation
+
+
+def _condition_uncertainty_summary(
+    rows: list[dict[str, object]], config: dict[str, Any]
+) -> dict[str, dict[str, float]]:
+    total = sum(float(row.get("predicted_time_seconds", 0.0)) for row in rows)
+    summary: dict[str, dict[str, float]] = {}
+    for source in CONDITION_SOURCES:
+        weighted_sigma = 0.0
+        active_seconds = 0.0
+        for row in rows:
+            seconds = float(row.get("predicted_time_seconds", 0.0))
+            factor = float(dict(row.get("condition_factors", {})).get(source, 1.0))
+            sigma = _condition_sigma_for_factor(source, factor, config)
+            weighted_sigma += seconds * sigma
+            if abs(factor - 1.0) > 1e-6:
+                active_seconds += seconds
+        summary[source] = {
+            "effective_sigma": round(weighted_sigma / total, 4) if total > 0 else 0.0,
+            "active_time_share": round(active_seconds / total, 4) if total > 0 else 0.0,
+        }
+    return summary
+
+
+def _weighted_condition_sigma(summary: dict[str, dict[str, float]]) -> float:
+    return float(np.sqrt(sum(float(item["effective_sigma"]) ** 2 for item in summary.values())))
+
+
+def _sample_gpx_geometry(
+    profile: dict[str, object],
+    row: dict[str, object],
+    count: int,
+    rng: np.random.Generator,
+    shared: np.ndarray,
+    sigma: float,
+    correlation: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Perturb vertical metres, then recalculate grade and terrain base time."""
+    original_seconds = float(row["base_time_seconds"])
+    original_grade = float(row.get("grade", 0.0))
+    terrain = str(row.get("type", "flat"))
+    if terrain == "flat" or not bool(row.get("elevation_available", True)):
+        return np.full(count, original_seconds), np.full(count, original_grade)
+
+    correlation = max(0.0, min(1.0, correlation))
+    z = np.sqrt(correlation) * shared + np.sqrt(1.0 - correlation) * rng.normal(size=count)
+    distance = max(float(row.get("distance", 0.0)), 0.1)
+    if terrain == "uphill":
+        vertical = max(float(row.get("gain", 0.0)), distance * max(original_grade, 0.0) / 100.0, 0.1)
+        sampled_vertical = vertical * np.exp(sigma * z)
+        sampled_grade = sampled_vertical / distance * 100.0
+        curve = list(profile.get("uphill", {}).get("curve", []))
+        if not curve:
+            return np.full(count, original_seconds), sampled_grade
+        grades = np.asarray([float(point["grade"]) for point in curve])
+        values = np.asarray([float(point["value"]) for point in curve])
+        vam = np.interp(sampled_grade, grades, values)
+        climbing = sampled_vertical / np.maximum(vam, 1.0) * 3600.0
+        flat_floor = distance / 1000.0 * float(profile["flat"]["aerobic_pace"])
+        return np.maximum(climbing, flat_floor), sampled_grade
+
+    vertical = max(float(row.get("loss", 0.0)), distance * max(-original_grade, 0.0) / 100.0, 0.1)
+    sampled_vertical = vertical * np.exp(sigma * z)
+    sampled_grade = -sampled_vertical / distance * 100.0
+    curve = list(profile.get("downhill", {}).get("curve", []))
+    if not curve:
+        return np.full(count, original_seconds), sampled_grade
+    grades = np.asarray([float(point["grade"]) for point in curve])
+    speeds = np.asarray([float(point["speed_mps"]) for point in curve])
+    order = np.argsort(grades)
+    speed = np.interp(sampled_grade, grades[order], speeds[order])
+    return distance / np.maximum(speed, 0.1), sampled_grade
 
 
 def _interpolate_fatigue_samples(

@@ -401,16 +401,19 @@ def render_result(result: dict[str, Any]) -> None:
         uncertainty = prediction["probability"].get("uncertainty", {})
         if uncertainty:
             st.subheader("概率区间依据")
+            confidence_details = uncertainty.get("route_weighted_confidence", {})
+            route_terrain_confidence = confidence_details.get("terrain", {})
             terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
             uncertainty_rows = []
             for terrain in ("flat", "uphill", "downhill"):
+                route_confidence = route_terrain_confidence.get(terrain, {})
                 uncertainty_rows.append(
                     [
                         terrain_labels[terrain],
                         f"{float(uncertainty.get('terrain_time_share', {}).get(terrain, 0)):.1%}",
-                        f"{_mean_confidence(uncertainty.get('ability_confidence', {}).get(terrain, 0.2)):.0%}",
-                        f"{_mean_confidence(uncertainty.get('fatigue_confidence', {}).get(terrain, [])):.0%}",
-                        f"{float(uncertainty.get('duration_confidence', {}).get(terrain, 0.2)):.0%}",
+                        f"{float(route_confidence.get('ability', _mean_confidence(uncertainty.get('ability_confidence', {}).get(terrain, 0.2)))):.0%}",
+                        f"{float(route_confidence.get('fatigue', _mean_confidence(uncertainty.get('fatigue_confidence', {}).get(terrain, [])))):.0%}",
+                        f"{float(route_confidence.get('duration', uncertainty.get('duration_confidence', {}).get(terrain, 0.2))):.0%}",
                     ]
                 )
             st.dataframe(
@@ -420,6 +423,35 @@ def render_result(result: dict[str, Any]) -> None:
                 ),
                 hide_index=True,
                 width="stretch",
+            )
+            st.caption(
+                f"路线加权综合可信度 {float(confidence_details.get('overall', prediction.get('confidence', .2))):.0%} · "
+                f"历史数据质量 {float(confidence_details.get('data_quality', .2)):.0%} · "
+                f"GPX 质量 {float(confidence_details.get('gpx_quality', 1)):.0%}"
+            )
+            condition_labels = {
+                "form": "当前状态", "technical": "技术难度", "mud": "泥泞", "night": "夜间",
+                "altitude": "高海拔", "carried_weight": "负重", "weather": "温湿度",
+            }
+            condition_rows = [
+                [condition_labels.get(source, source),
+                 f"{float(values.get('active_time_share', 0)):.1%}",
+                 f"{float(values.get('effective_sigma', 0)):.1%}"]
+                for source, values in uncertainty.get("condition_sources", {}).items()
+                if float(values.get("active_time_share", 0)) > 0
+            ]
+            if condition_rows:
+                st.markdown("**条件不确定性来源**")
+                st.dataframe(
+                    pd.DataFrame(condition_rows, columns=["条件", "影响时间占比", "有效波动"]),
+                    hide_index=True,
+                    width="stretch",
+                )
+            gpx_uncertainty = uncertainty.get("gpx", {})
+            st.caption(
+                "GPX 使用坡段爬升/下降物理扰动："
+                f"坡段影响占比 {float(gpx_uncertainty.get('affected_time_share', 0)):.1%}，"
+                f"垂直误差波动 {float(gpx_uncertainty.get('vertical_sigma', uncertainty.get('gpx_sigma', 0))):.1%}。"
             )
         st.subheader("时间损耗拆解")
         labels = {"base_terrain": "基础地形", "duration_adaptation": "目标时长适配", "fatigue": "疲劳",

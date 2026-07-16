@@ -340,8 +340,10 @@ def test_phase2_monte_carlo_is_reproducible() -> None:
     first = predict_race(profile, segments, simulations=1000, seed=99)
     second = predict_race(profile, segments, simulations=1000, seed=99)
     assert first["probability"] == second["probability"]
-    assert first["probability"]["method"] == "segmented_terrain_fatigue"
+    assert first["probability"]["method"] == "segmented_source_condition_physical_gpx"
     assert set(first["probability"]["uncertainty"]["ability_confidence"]) == {"flat", "uphill", "downhill"}
+    assert first["probability"]["uncertainty"]["gpx"]["mode"] == "segment_elevation_grade"
+    assert "route_weighted_confidence" in first["probability"]["uncertainty"]
 
 
 def test_segmented_probability_reflects_route_terrain_confidence() -> None:
@@ -368,6 +370,39 @@ def test_segmented_probability_reflects_route_terrain_confidence() -> None:
     assert flat_prediction["probability"]["uncertainty"]["terrain_time_share"]["flat"] == 1.0
     assert uphill_prediction["probability"]["uncertainty"]["terrain_time_share"]["uphill"] == 1.0
     assert uphill_prediction["probability"]["sigma"] > flat_prediction["probability"]["sigma"]
+    assert uphill_prediction["confidence"] < flat_prediction["confidence"]
+
+
+def test_probability_separates_condition_sources_and_gpx_geometry() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    segments = [{"distance": 1000.0, "gain": 100.0, "loss": 0.0, "grade": 10.0,
+                 "type": "uphill", "start_km": 0.0, "end_km": 1.0,
+                 "elevation": 1800.0, "elevation_available": True}]
+    prediction = predict_race(
+        profile,
+        segments,
+        condition=RaceCondition(current_form="poor", terrain_technical_level=3, mud_level=2),
+        simulations=1000,
+        seed=41,
+        gpx_quality_score=0.5,
+    )
+    high_quality = predict_race(
+        profile,
+        segments,
+        condition=RaceCondition(current_form="poor", terrain_technical_level=3, mud_level=2),
+        simulations=1000,
+        seed=41,
+        gpx_quality_score=1.0,
+    )
+    uncertainty = prediction["probability"]["uncertainty"]
+
+    assert uncertainty["condition_sources"]["form"]["active_time_share"] == 1.0
+    assert uncertainty["condition_sources"]["technical"]["effective_sigma"] > 0
+    assert uncertainty["condition_sources"]["mud"]["effective_sigma"] > 0
+    assert uncertainty["condition_sources"]["night"]["effective_sigma"] == 0
+    assert uncertainty["gpx"]["affected_time_share"] == 1.0
+    assert uncertainty["route_weighted_confidence"]["gpx_quality"] == 0.5
+    assert prediction["probability"]["sigma"] > high_quality["probability"]["sigma"]
 
 
 def test_segmented_probability_samples_uphill_fatigue_separately() -> None:

@@ -150,16 +150,51 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         duration_rows.append(f"| {terrain_labels[terrain]} | {weights} | ×{float(match.get('factor', 1)):.3f} | {float(match.get('confidence', .2)):.0%} | {match.get('source', 'legacy')} |")
     insertion = lines.index("## 分段预测")
     probability_uncertainty = prediction.get("probability", {}).get("uncertainty", {})
+    confidence_details = probability_uncertainty.get("route_weighted_confidence", {})
+    route_terrain_confidence = confidence_details.get("terrain", {})
     probability_rows = []
     terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
     for terrain in ("flat", "uphill", "downhill"):
+        route_confidence = route_terrain_confidence.get(terrain, {})
         probability_rows.append(
             f"| {terrain_labels[terrain]} | "
             f"{float(probability_uncertainty.get('terrain_time_share', {}).get(terrain, 0)):.1%} | "
-            f"{_mean_confidence(probability_uncertainty.get('ability_confidence', {}).get(terrain, 0.2)):.0%} | "
-            f"{_mean_confidence(probability_uncertainty.get('fatigue_confidence', {}).get(terrain, [])):.0%} | "
-            f"{float(probability_uncertainty.get('duration_confidence', {}).get(terrain, 0.2)):.0%} |"
+            f"{float(route_confidence.get('ability', _mean_confidence(probability_uncertainty.get('ability_confidence', {}).get(terrain, 0.2)))):.0%} | "
+            f"{float(route_confidence.get('fatigue', _mean_confidence(probability_uncertainty.get('fatigue_confidence', {}).get(terrain, [])))):.0%} | "
+            f"{float(route_confidence.get('duration', probability_uncertainty.get('duration_confidence', {}).get(terrain, 0.2))):.0%} |"
         )
+    condition_sources = probability_uncertainty.get("condition_sources", {})
+    condition_rows = [
+        f"| {_breakdown_label(source)} | {float(values.get('active_time_share', 0)):.1%} | "
+        f"{float(values.get('effective_sigma', 0)):.1%} |"
+        for source, values in condition_sources.items()
+        if float(values.get("active_time_share", 0)) > 0
+    ]
+    gpx_uncertainty = probability_uncertainty.get("gpx", {})
+    uncertainty_details = [
+        "",
+        f"路线加权综合可信度：{float(confidence_details.get('overall', prediction.get('confidence', .2))):.0%}；"
+        f"历史数据质量：{float(confidence_details.get('data_quality', .2)):.0%}；"
+        f"GPX 质量：{float(confidence_details.get('gpx_quality', 1)):.0%}。",
+        "",
+    ]
+    if condition_rows:
+        uncertainty_details += [
+            "#### 条件不确定性来源",
+            "",
+            "| 条件 | 影响时间占比 | 有效波动 |",
+            "| --- | ---: | ---: |",
+            *condition_rows,
+            "",
+        ]
+    uncertainty_details += [
+        "#### GPX 几何误差",
+        "",
+        f"采用坡段爬升/下降扰动并重新计算坡度和基础时间；坡段影响占比 "
+        f"{float(gpx_uncertainty.get('affected_time_share', 0)):.1%}，垂直误差波动 "
+        f"{float(gpx_uncertainty.get('vertical_sigma', probability_uncertainty.get('gpx_sigma', 0))):.1%}。",
+        "",
+    ]
     lines[insertion:insertion] = duration_rows + [
         "",
         "### 概率区间依据",
@@ -168,7 +203,7 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         "",
         "| 地形 | 预计耗时占比 | 能力可信度 | 疲劳可信度 | 持续能力可信度 |",
         "| --- | ---: | ---: | ---: | ---: |",
-    ] + probability_rows + ["", "### 时间损耗拆解", "", "| 项目 | 时间影响 |", "| --- | ---: |"] + [
+    ] + probability_rows + uncertainty_details + ["### 时间损耗拆解", "", "| 项目 | 时间影响 |", "| --- | ---: |"] + [
         f"| {_breakdown_label(key)} | {format_duration(float(value))} |" for key, value in prediction.get("adjustment_breakdown", {}).items()
     ] + [""]
     for row in prediction["segments"]:
