@@ -83,6 +83,28 @@ http://localhost:8501
 
 不建议用于建模的活动默认不会被选中，用户仍可手动调整。
 
+## Windows 便携版
+
+便携版使用 PyInstaller `onedir` 构建，目标电脑不需要安装 Python。构建环境仍建议使用项目虚拟环境：
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
+```
+
+双击 `build_windows.bat`，或执行：
+
+```powershell
+.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm trail_predictor.spec
+```
+
+构建结果位于：
+
+```text
+dist/TrailTimePredictor/TrailTimePredictor.exe
+```
+
+分发时必须保留整个 `TrailTimePredictor` 目录，不能只复制 EXE。应用启动后会显示本地控制窗口，等待服务就绪后自动打开浏览器；关闭控制窗口会同时停止后台服务。天气缓存和运行日志保存在 `%LOCALAPPDATA%\TrailTimePredictor`。
+
 ## 命令行使用
 
 默认读取：

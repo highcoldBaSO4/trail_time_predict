@@ -1,3 +1,6 @@
+[global]
+developmentMode = false
+
 [theme]
 base = "light"
 primaryColor = "#16833D"
@@ -10,4 +13,5 @@ font = "sans serif"
 gatherUsageStats = false
 
 [server]
-headless = false
+headless = true
+address = "127.0.0.1"

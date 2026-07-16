@@ -8,6 +8,8 @@ from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
+from runtime_paths import weather_cache_directory
+
 import numpy as np
 import pandas as pd
 
@@ -150,8 +152,7 @@ def _weather_payload(
         "cell_selection": "land",
     }
     encoded = urlencode(params)
-    cache_dir = Path(__file__).resolve().parents[1] / str(config["cache_directory"])
-    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir = weather_cache_directory(str(config["cache_directory"]))
     cache_key = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
     cache_path = cache_dir / f"{cache_key}.json"
     if cache_path.is_file():
