@@ -7,6 +7,7 @@ from datetime import datetime
 @dataclass(frozen=True)
 class RaceCondition:
     current_form: str = "normal"
+    pacing_strategy: str = "standard"
     temperature_c: float | None = None
     humidity_percent: float | None = None
     altitude_factor: float = 1.0
@@ -21,6 +22,11 @@ class RaceCondition:
         """Clamp user-controlled fields to safe model ranges."""
         return RaceCondition(
             current_form=self.current_form,
+            pacing_strategy=(
+                self.pacing_strategy
+                if self.pacing_strategy in {"conservative", "standard", "aggressive"}
+                else "standard"
+            ),
             temperature_c=self.temperature_c,
             humidity_percent=None if self.humidity_percent is None else min(100.0, max(0.0, self.humidity_percent)),
             altitude_factor=max(0.8, min(1.5, self.altitude_factor)),

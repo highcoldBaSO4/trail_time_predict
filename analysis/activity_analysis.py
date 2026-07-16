@@ -6,6 +6,7 @@ import pandas as pd
 
 def add_interval_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     """Add robust point-to-point metrics used by all capability models."""
+    source_attrs = dict(frame.attrs)
     data = frame.copy().sort_values("timestamp").reset_index(drop=True)
     data["dt_seconds"] = data["timestamp"].diff().dt.total_seconds()
     data["dd_m"] = data["distance"].diff()
@@ -25,6 +26,7 @@ def add_interval_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     data["valid_interval"] = valid
     data.loc[~valid, ["speed_mps", "grade_pct"]] = np.nan
     data["grade_pct"] = data["grade_pct"].clip(-60.0, 60.0)
+    data.attrs.update(source_attrs)
     return data
 
 
@@ -45,6 +47,8 @@ def analyze_activity(frame: pd.DataFrame, name: str | None = None) -> dict[str, 
         "avg_hr": _safe_mean(data["heart_rate"]),
         "max_hr": _safe_max(data["heart_rate"]),
         "avg_cadence": _safe_mean(data["cadence"]),
+        "avg_temperature": _estimated_ambient_mean(data),
+        "avg_device_temperature": _safe_mean(data["device_temperature"]) if "device_temperature" in data else None,
     }
 
 
@@ -57,3 +61,8 @@ def _safe_max(series: pd.Series) -> float | None:
     value = series.dropna().max()
     return None if pd.isna(value) else round(float(value), 1)
 
+
+def _estimated_ambient_mean(data: pd.DataFrame) -> float | None:
+    if "device_temperature" not in data:
+        return _safe_mean(data["temperature"]) if "temperature" in data else None
+    return None

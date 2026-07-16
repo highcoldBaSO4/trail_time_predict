@@ -10,6 +10,7 @@ def condition_factors(
     target_night_ratio: float | None = None,
     historical_night_ratio: float = 0.0,
     automatic_altitude_factor: float | None = None,
+    temperature_factor: float | None = None,
 ) -> dict[str, float]:
     """Return explainable time multipliers for one terrain segment."""
     condition = condition.normalized()
@@ -23,11 +24,11 @@ def condition_factors(
     night = (1.0 + target_night * night_penalty) / (1.0 + historical_night * night_penalty)
     weight = 1.0 + condition.carried_weight_kg * float(config["carried_weight_per_kg"][terrain])
     heat_config = config["heat"]
-    heat = 1.0
-    if condition.temperature_c is not None:
+    heat = float(temperature_factor) if temperature_factor is not None else 1.0
+    if temperature_factor is None and condition.temperature_c is not None:
         heat += max(0.0, condition.temperature_c - float(heat_config["threshold_c"])) * float(heat_config["per_degree"])
     if condition.humidity_percent is not None:
-        heat += max(0.0, condition.humidity_percent - float(heat_config["humidity_threshold_percent"])) * float(heat_config["humidity_per_percent"])
+        heat *= 1.0 + max(0.0, condition.humidity_percent - float(heat_config["humidity_threshold_percent"])) * float(heat_config["humidity_per_percent"])
     return {
         "form": float(form_entry["factor"]),
         "technical": technical,

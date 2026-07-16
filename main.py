@@ -29,7 +29,7 @@ def run_pipeline(
     _emit(progress, "[1/5] 正在解析历史 FIT 文件……")
     activities = read_fit_directory(activities_dir, progress=progress)
     _emit(progress, f"[2/5] 正在汇总 {len(activities)} 个活动并建立个人能力画像……")
-    profile = build_runner_profile(activities)
+    profile = build_runner_profile(activities, progress=progress)
     save_runner_profile(profile, output / "runner_profile.json")
 
     _emit(progress, "[3/5] 正在解析比赛 GPX 并生成路线分段……")
@@ -76,13 +76,14 @@ def save_elevation_chart(segments: list[dict[str, object]], path: str | Path) ->
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="越野跑比赛时间概率预测 V0.2")
+    parser = argparse.ArgumentParser(description="越野跑比赛时间概率预测 V0.3")
     parser.add_argument("--activities", default="data/activities", help="历史 FIT 文件目录")
     parser.add_argument("--race", default="data/races/race.gpx", help="比赛 GPX 路径")
     parser.add_argument("--output", default="output", help="报告输出目录")
     parser.add_argument("--segment-distance", type=float, default=100.0, help="地形坡度采样窗口（米）")
     parser.add_argument("--aid-minutes", type=float, default=0.0, help="预计补给/停留总时间（分钟）")
     parser.add_argument("--current-form", choices=["very_good", "normal", "slight_fatigue", "poor", "ill_or_injured"], default="normal", help="当前身体状态")
+    parser.add_argument("--pacing-strategy", choices=["conservative", "standard", "aggressive"], default="standard", help="比赛强度策略")
     parser.add_argument("--temperature", type=float, default=None, help="比赛温度（摄氏度）")
     parser.add_argument("--humidity", type=float, default=None, help="相对湿度百分比")
     parser.add_argument("--technical-level", type=int, choices=range(5), default=0, help="技术难度 0-4")
@@ -117,7 +118,8 @@ if __name__ == "__main__":
         args.output,
         args.segment_distance,
         args.aid_minutes,
-        condition=RaceCondition(current_form=args.current_form, temperature_c=args.temperature,
+        condition=RaceCondition(current_form=args.current_form, pacing_strategy=args.pacing_strategy,
+                                temperature_c=args.temperature,
                                 humidity_percent=args.humidity, altitude_factor=args.altitude_factor,
                                 terrain_technical_level=args.technical_level, mud_level=args.mud_level,
                                 night_running_ratio=args.night_ratio, carried_weight_kg=args.carried_weight,

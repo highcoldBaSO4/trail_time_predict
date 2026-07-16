@@ -41,7 +41,7 @@ class PredictionResult:
         return result
 
     def validate(self) -> None:
-        """Enforce ordering and range guarantees required by V0.2."""
+        """Enforce ordering and range guarantees required by V0.3."""
         times = (
             self.standard_moving_time_seconds,
             self.adjusted_moving_time_seconds,

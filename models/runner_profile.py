@@ -93,6 +93,8 @@ class RunnerProfile:
     fatigue_curve_uphill: list[CurvePoint]
     fatigue_curve_downhill: list[CurvePoint]
     source_activity_count: int
+    temperature_profile: dict[str, Any] = field(default_factory=dict)
+    heart_rate_profile: dict[str, Any] = field(default_factory=dict)
     generated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -138,6 +140,8 @@ class RunnerProfile:
                 fatigue_curve_uphill=[CurvePoint.from_dict(point, "hour", "factor") for point in fatigue.get("uphill", legacy_fatigue)],
                 fatigue_curve_downhill=[CurvePoint.from_dict(point, "hour", "factor") for point in fatigue.get("downhill", legacy_fatigue)],
                 source_activity_count=int(data["sample_count"]),
+                temperature_profile=deepcopy(data.get("temperature", {})),
+                heart_rate_profile=deepcopy(data.get("heart_rate", {})),
                 generated_at=generated_at,
                 metadata=deepcopy(data),
             )
@@ -163,11 +167,15 @@ class RunnerProfile:
                 raise ValueError(f"{name}能力曲线不能为空")
             for point in curve:
                 point.validate()
+        for name, model in (("温度", self.temperature_profile), ("心率", self.heart_rate_profile)):
+            if model and not 0.0 <= float(model.get("confidence", 0.2)) <= 1.0:
+                raise ValueError(f"{name}模型可信度必须在0到1之间")
 
     def to_profile_dict(self) -> dict[str, Any]:
         """Return the existing JSON shape after typed validation."""
         self.validate()
         data = deepcopy(self.metadata)
+        data["schema_version"] = "0.3"
         data["generated_at"] = self.generated_at.isoformat()
         data["sample_count"] = self.source_activity_count
         data["flat"]["aerobic_pace"] = self.flat_aerobic_pace.value
@@ -177,6 +185,8 @@ class RunnerProfile:
         data["fatigue"]["flat"] = [point.to_dict("hour", "factor") for point in self.fatigue_curve_flat]
         data["fatigue"]["uphill"] = [point.to_dict("hour", "factor") for point in self.fatigue_curve_uphill]
         data["fatigue"]["downhill"] = [point.to_dict("hour", "factor") for point in self.fatigue_curve_downhill]
+        data["temperature"] = deepcopy(self.temperature_profile)
+        data["heart_rate"] = deepcopy(self.heart_rate_profile)
         return data
 
     def to_dict(self) -> dict[str, Any]:

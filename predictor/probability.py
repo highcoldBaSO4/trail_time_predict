@@ -8,7 +8,10 @@ from config import load_config
 
 
 TERRAINS = ("flat", "uphill", "downhill")
-CONDITION_SOURCES = ("form", "technical", "mud", "night", "altitude", "carried_weight", "weather")
+CONDITION_SOURCES = (
+    "heart_rate_pacing", "form", "technical", "mud", "night", "altitude", "carried_weight",
+    "temperature_fatigue", "heart_rate_fatigue", "weather",
+)
 
 
 def simulate_segmented_finish_times(
@@ -264,20 +267,26 @@ def _condition_noise_for_row(
     config: dict[str, Any],
 ) -> np.ndarray:
     factors = dict(row.get("condition_factors", {}))
+    confidences = dict(row.get("condition_confidence", {}))
     sample = np.ones_like(next(iter(latents.values()))[terrain])
     for source in CONDITION_SOURCES:
-        sigma = _condition_sigma_for_factor(source, float(factors.get(source, 1.0)), config)
+        sigma = _condition_sigma_for_factor(
+            source, float(factors.get(source, 1.0)), config, float(confidences.get(source, 0.7))
+        )
         if sigma > 0:
             sample *= np.exp(sigma * latents[source][terrain])
     return sample
 
 
-def _condition_sigma_for_factor(source: str, factor: float, config: dict[str, Any]) -> float:
+def _condition_sigma_for_factor(
+    source: str, factor: float, config: dict[str, Any], confidence: float = 0.7
+) -> float:
     source_sigmas = dict(config.get("condition_source_sigma", {}))
     maximum = float(source_sigmas.get(source, config.get("condition_sigma", 0.02)))
     reference = max(float(config.get("condition_activation_reference", 0.10)), 1e-6)
     activation = min(abs(float(factor) - 1.0) / reference, 1.0)
-    return maximum * activation
+    confidence_scale = 1.25 - 0.5 * max(0.0, min(1.0, confidence))
+    return maximum * activation * confidence_scale
 
 
 def _condition_uncertainty_summary(
@@ -291,7 +300,8 @@ def _condition_uncertainty_summary(
         for row in rows:
             seconds = float(row.get("predicted_time_seconds", 0.0))
             factor = float(dict(row.get("condition_factors", {})).get(source, 1.0))
-            sigma = _condition_sigma_for_factor(source, factor, config)
+            confidence = float(dict(row.get("condition_confidence", {})).get(source, 0.7))
+            sigma = _condition_sigma_for_factor(source, factor, config, confidence)
             weighted_sigma += seconds * sigma
             if abs(factor - 1.0) > 1e-6:
                 active_seconds += seconds

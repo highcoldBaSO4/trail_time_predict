@@ -39,7 +39,29 @@ def diagnose_fit(frame: pd.DataFrame) -> dict[str, Any]:
     if "heart_rate" in frame and frame["heart_rate"].isna().mean() > 0.50:
         issues.append("心率大量缺失")
     score = max(0.1, 1.0 - len(issues) * 0.14)
-    return _report(score, issues, score >= 0.55 and duration >= 600)
+    report = _report(score, issues, score >= 0.55 and duration >= 600)
+    temperature = pd.to_numeric(frame.get("temperature"), errors="coerce") if "temperature" in frame else pd.Series(dtype=float)
+    valid_temperature = temperature.between(-30.0, 60.0)
+    coverage = float(valid_temperature.mean()) if len(temperature) else 0.0
+    device_temperature = (
+        pd.to_numeric(frame.get("device_temperature"), errors="coerce")
+        if "device_temperature" in frame else pd.Series(dtype=float)
+    )
+    device_coverage = float(device_temperature.between(-30.0, 70.0).mean()) if len(device_temperature) else 0.0
+    temperature_issues: list[str] = []
+    if coverage == 0 and device_coverage > 0:
+        temperature_issues.append("FIT仅包含腕表温度，不作为环境温度")
+    elif coverage == 0:
+        temperature_issues.append("FIT没有可用温度数据")
+    elif coverage < 0.50:
+        temperature_issues.append("FIT温度覆盖率较低")
+    if valid_temperature.any() and temperature[valid_temperature].diff().abs().max() > 10.0:
+        temperature_issues.append("FIT温度存在明显跳变")
+    report["heart_rate_coverage"] = round(float(frame["heart_rate"].notna().mean()), 3) if "heart_rate" in frame else 0.0
+    report["temperature_coverage"] = round(coverage, 3)
+    report["device_temperature_coverage"] = round(device_coverage, 3)
+    report["temperature_issues"] = temperature_issues
+    return report
 
 
 def diagnose_gpx(points: list[dict[str, float | None]]) -> dict[str, Any]:

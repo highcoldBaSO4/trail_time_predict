@@ -59,3 +59,5 @@ data/activities/*
 !data/activities/.gitkeep
 data/races/*
 !data/races/.gitkeep
+data/weather_cache/*
+!data/weather_cache/.gitkeep

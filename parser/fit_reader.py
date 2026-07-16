@@ -20,7 +20,16 @@ FIT_COLUMNS = [
     "heart_rate",
     "cadence",
     "power",
+    "temperature",
+    "device_temperature",
+    "temperature_weight",
 ]
+
+TEMPERATURE_WEIGHTS = {
+    "record": 1.0,
+    "lap_average": 0.65,
+    "session_average": 0.35,
+}
 
 # Some exporters encode event.data as a one-byte uint32. The definition is
 # internally inconsistent, but the data itself is one byte and the file CRC is
@@ -47,6 +56,7 @@ def read_fit(
     Corrupt files and files without record messages raise ValueError with context.
     """
     rows: list[dict[str, object]] = []
+    lap_values: list[dict[str, object]] = []
     session_values: dict[str, object] = {}
     source_name = Path(source).name if isinstance(source, (str, Path)) else getattr(source, "name", "上传文件")
     try:
@@ -72,10 +82,18 @@ def read_fit(
                     "heart_rate": values.get("heart_rate"),
                     "cadence": values.get("cadence"),
                     "power": values.get("power"),
+                    "temperature": values.get("temperature"),
+                    "device_temperature": values.get("temperature"),
+                    "temperature_weight": (
+                        TEMPERATURE_WEIGHTS["record"]
+                        if values.get("temperature") is not None
+                        else np.nan
+                    ),
                 }
             )
             if len(rows) % 5000 == 0:
                 _emit(progress, f"    {source_name}：已解析 {len(rows):,} 条轨迹记录")
+        lap_values = [message.get_values() for message in fit_file.get_messages("lap")]
         sessions = list(fit_file.get_messages("session"))
         session_values = sessions[-1].get_values() if sessions else {}
     except Exception as exc:  # fitparse exposes several decoder exception types
@@ -102,10 +120,87 @@ def read_fit(
     )
     if frame.empty:
         raise ValueError("FIT 文件没有有效的时间戳记录")
+    temperature_stats = _fill_average_temperatures(frame, lap_values, session_values)
+    frame["device_temperature"] = frame["temperature"]
+    # FIT temperature from a worn watch is not an ambient measurement. Keep it
+    # under device_temperature; temperature is reserved for calibrated ambient data.
+    frame["temperature"] = np.nan
     frame.attrs["sport"] = session_values.get("sport")
     frame.attrs["sub_sport"] = session_values.get("sub_sport")
+    frame.attrs["temperature_source"] = temperature_stats["source"]
+    frame.attrs["temperature_source_counts"] = temperature_stats["counts"]
+    frame.attrs["temperature_measurement"] = "wrist_device"
+    if temperature_stats["fallback_count"]:
+        _emit(
+            progress,
+            f"    {source_name}：逐点腕表温度缺失，已使用{temperature_stats['source_label']}"
+            f"补充 {temperature_stats['fallback_count']:,} 条记录",
+        )
     _emit(progress, f"    {source_name}：完成，共 {len(frame):,} 条有效记录")
     return frame
+
+
+def _fill_average_temperatures(
+    frame: pd.DataFrame,
+    laps: list[dict[str, object]],
+    session: dict[str, object],
+) -> dict[str, object]:
+    """Fill missing record temperatures from lap/session averages.
+
+    FIT exporters may omit record.temperature while retaining avg_temperature on
+    lap or session messages. Lap averages are matched by time range first; the
+    session average only fills records that still have no temperature.
+    """
+    source = pd.Series(pd.NA, index=frame.index, dtype="string")
+    record_mask = frame["temperature"].notna()
+    source.loc[record_mask] = "record"
+
+    for lap in laps:
+        average = pd.to_numeric(lap.get("avg_temperature"), errors="coerce")
+        if pd.isna(average):
+            continue
+        start = _utc_timestamp(lap.get("start_time"))
+        end = _utc_timestamp(lap.get("timestamp"))
+        elapsed = pd.to_numeric(lap.get("total_elapsed_time"), errors="coerce")
+        if start is None and end is not None and pd.notna(elapsed):
+            start = end - pd.to_timedelta(float(elapsed), unit="s")
+        if end is None and start is not None and pd.notna(elapsed):
+            end = start + pd.to_timedelta(float(elapsed), unit="s")
+        if start is None or end is None:
+            continue
+        missing = frame["temperature"].isna()
+        in_lap = frame["timestamp"].between(start, end, inclusive="both")
+        mask = missing & in_lap
+        frame.loc[mask, "temperature"] = float(average)
+        frame.loc[mask, "temperature_weight"] = TEMPERATURE_WEIGHTS["lap_average"]
+        source.loc[mask] = "lap_average"
+
+    session_average = pd.to_numeric(session.get("avg_temperature"), errors="coerce")
+    if pd.notna(session_average):
+        mask = frame["temperature"].isna()
+        frame.loc[mask, "temperature"] = float(session_average)
+        frame.loc[mask, "temperature_weight"] = TEMPERATURE_WEIGHTS["session_average"]
+        source.loc[mask] = "session_average"
+
+    counts = {
+        name: int((source == name).sum())
+        for name in ("record", "lap_average", "session_average")
+    }
+    used = [name for name, count in counts.items() if count]
+    fallback_count = counts["lap_average"] + counts["session_average"]
+    labels = {"lap_average": "分圈平均温度", "session_average": "全程平均温度"}
+    fallback_sources = [labels[name] for name in ("lap_average", "session_average") if counts[name]]
+    return {
+        "source": "+".join(used) if used else "unavailable",
+        "source_label": "和".join(fallback_sources),
+        "counts": counts,
+        "fallback_count": fallback_count,
+    }
+
+
+def _utc_timestamp(value: object) -> pd.Timestamp | None:
+    timestamp = pd.to_datetime(value, errors="coerce", utc=True)
+    return None if pd.isna(timestamp) else pd.Timestamp(timestamp)
 
 
 def read_fit_directory(

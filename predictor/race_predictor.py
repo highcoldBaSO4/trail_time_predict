@@ -9,6 +9,12 @@ from analysis.downhill import interpolate_downhill_speed
 from analysis.environment import relative_altitude_factor, solar_elevation_degrees
 from analysis.fatigue import interpolate_fatigue
 from analysis.uphill import interpolate_uphill_vam
+from analysis.heart_rate import heart_rate_pacing_adjustment, interpolate_hr_drift
+from analysis.temperature import (
+    heart_rate_heat_fatigue_time_factor,
+    temperature_fatigue_time_factor,
+    temperature_time_factor,
+)
 from config import load_config
 from models import PredictionResult, RaceCondition, RunnerProfile
 from parser.gpx_reader import route_summary
@@ -62,7 +68,7 @@ def predict_race(
     environment_summary = _environment_summary(profile, adjusted_rows)
 
     payload = {
-        "schema_version": "0.2",
+        "schema_version": "0.3",
         "route": route_summary(segments),
         "condition": race_condition.to_dict(),
         "standard_moving_time_seconds": round(standard_seconds, 1),
@@ -78,6 +84,7 @@ def predict_race(
         "probability": probability,
         "risk_notes": risks,
         "environment": environment_summary,
+        "physiology": _physiology_summary(profile, race_condition, adjusted_rows),
         "segments": adjusted_rows,
         # V0.1 compatibility fields.
         "moving_time_seconds": round(adjusted_seconds, 1),
@@ -93,9 +100,11 @@ def _predict_once(
 ) -> tuple[list[dict[str, object]], float, dict[str, float]]:
     elapsed = 0.0
     rows: list[dict[str, object]] = []
-    totals = {"base_terrain": 0.0, "duration_adaptation": 0.0, "fatigue": 0.0,
+    totals = {"base_terrain": 0.0, "heart_rate_pacing": 0.0,
+              "duration_adaptation": 0.0, "fatigue": 0.0,
               "form": 0.0, "technical": 0.0, "mud": 0.0, "night": 0.0,
-              "altitude": 0.0, "carried_weight": 0.0, "weather": 0.0}
+              "altitude": 0.0, "carried_weight": 0.0, "weather": 0.0,
+              "temperature_fatigue": 0.0, "heart_rate_fatigue": 0.0}
     for segment in segments:
         terrain = str(segment.get("type", "flat"))
         raw_seconds, basis = _base_segment_seconds(profile, segment)
@@ -103,8 +112,38 @@ def _predict_once(
         sustainable_seconds = raw_seconds * float(match["factor"])
         fatigue = fatigue_factor(profile, elapsed / 3600.0, terrain)
         standard_seconds = sustainable_seconds / max(fatigue, 0.1)
+        base_output = _segment_output(segment, raw_seconds)
+        pacing = (
+            heart_rate_pacing_adjustment(
+                profile,
+                terrain,
+                float(segment.get("grade", 0.0)),
+                estimated_hours,
+                condition.pacing_strategy,
+                base_output,
+                (elapsed + standard_seconds / 2.0) / 3600.0,
+            )
+            if apply_environment
+            else {
+                "strategy": "standard", "intensity_label": "标准能力", "target_hr_bpm": None,
+                "expected_hr_bpm": None, "time_factor": 1.0, "output_factor": 1.0,
+                "confidence": 0.2, "source": "baseline", "extrapolated": False,
+            }
+        )
         environment = _segment_environment(
             profile, segment, condition, elapsed, standard_seconds, apply_environment
+        )
+        physiology_elapsed_hours = (elapsed + standard_seconds / 2.0) / 3600.0
+        direct_temperature = (
+            temperature_time_factor(profile, condition.temperature_c) if apply_environment else 1.0
+        )
+        temperature_fatigue = (
+            temperature_fatigue_time_factor(profile, condition.temperature_c, physiology_elapsed_hours)
+            if apply_environment else 1.0
+        )
+        heart_rate_fatigue = (
+            heart_rate_heat_fatigue_time_factor(profile, condition.temperature_c, physiology_elapsed_hours)
+            if apply_environment else 1.0
         )
         factors = condition_factors(
             condition,
@@ -112,7 +151,21 @@ def _predict_once(
             target_night_ratio=float(environment["night_ratio"]),
             historical_night_ratio=float(environment["historical_night_ratio"]),
             automatic_altitude_factor=float(environment["altitude_factor"]),
+            temperature_factor=direct_temperature,
         )
+        factors = {"heart_rate_pacing": float(pacing["time_factor"]), **factors}
+        weather = factors.pop("weather")
+        factors["temperature_fatigue"] = temperature_fatigue
+        factors["heart_rate_fatigue"] = heart_rate_fatigue
+        factors["weather"] = weather
+        temperature_confidence = float(profile.get("temperature", {}).get("confidence", 0.2))
+        heart_rate_confidence = float(profile.get("heart_rate", {}).get("confidence", 0.2))
+        condition_confidence = {
+            "heart_rate_pacing": float(pacing.get("confidence", 0.2)),
+            "weather": temperature_confidence,
+            "temperature_fatigue": temperature_confidence,
+            "heart_rate_fatigue": heart_rate_confidence,
+        }
         adjusted = standard_seconds
         factor_increases: dict[str, float] = {}
         for name, factor in factors.items():
@@ -132,12 +185,32 @@ def _predict_once(
                      "fatigue_factor": round(fatigue, 3),
                      "standard_time_seconds": round(standard_seconds, 1),
                      "condition_factors": {key: round(value, 4) for key, value in factors.items()},
+                     "condition_confidence": condition_confidence,
                      "condition_factor": round(adjusted / max(standard_seconds, 0.1), 4),
                      "condition_increase_seconds": {key: round(value, 1) for key, value in factor_increases.items()},
                      "environment": environment,
+                     "physiology": {
+                         "temperature_c": condition.temperature_c,
+                         "temperature_direct_factor": round(direct_temperature, 4),
+                         "temperature_fatigue_factor": round(temperature_fatigue, 4),
+                         "heart_rate_fatigue_factor": round(heart_rate_fatigue, 4),
+                         "pacing": pacing,
+                         "expected_hr_drift_bpm": round(interpolate_hr_drift(profile, physiology_elapsed_hours), 1),
+                         "temperature_model_source": str(profile.get("temperature", {}).get("source", "default")),
+                         "heart_rate_model_source": str(profile.get("heart_rate", {}).get("source", "unavailable")),
+                     },
                      "predicted_time_seconds": round(adjusted, 1),
                      "cumulative_time_seconds": round(elapsed, 1), "basis": basis})
     return rows, elapsed, {key: round(value, 1) for key, value in totals.items()}
+
+
+def _segment_output(segment: dict[str, float | str], raw_seconds: float) -> float:
+    if raw_seconds <= 0:
+        return 0.0
+    if str(segment.get("type", "flat")) == "uphill":
+        gain = max(float(segment.get("gain", 0.0)), float(segment["distance"]) * max(float(segment["grade"]), 0.0) / 100.0)
+        return gain / raw_seconds * 3600.0
+    return float(segment["distance"]) / raw_seconds
 
 
 def fatigue_factor(profile: dict[str, object], elapsed_hour: float, terrain: str = "flat") -> float:
@@ -232,6 +305,26 @@ def _prediction_confidence_details(
         confidence -= altitude_penalty
     gpx_quality = max(0.0, min(1.0, float(gpx_quality_score)))
     confidence = confidence * 0.90 + gpx_quality * 0.10
+    physiology_confidence: float | None = None
+    temperature_active = any(row.get("physiology", {}).get("temperature_c") is not None for row in rows)
+    pacing_active = any(
+        row.get("physiology", {}).get("pacing", {}).get("source") == "personal" for row in rows
+    )
+    if temperature_active or pacing_active:
+        temperature_confidence = float(profile.get("temperature", {}).get("confidence", 0.2))
+        hr_active = any(
+            float(row.get("physiology", {}).get("heart_rate_fatigue_factor", 1.0)) > 1.0001
+            for row in rows
+        )
+        heart_rate_confidence = float(profile.get("heart_rate", {}).get("confidence", 0.2))
+        if temperature_active:
+            physiology_confidence = (
+                temperature_confidence * 0.75 + heart_rate_confidence * 0.25
+                if hr_active or pacing_active else temperature_confidence
+            )
+        else:
+            physiology_confidence = heart_rate_confidence
+        confidence = confidence * 0.90 + physiology_confidence * 0.10
 
     terrain_details: dict[str, dict[str, float]] = {}
     for terrain, seconds in terrain_totals.items():
@@ -247,6 +340,7 @@ def _prediction_confidence_details(
         "route_capability": round(route_capability, 3),
         "data_quality": round(data_quality, 3),
         "gpx_quality": round(gpx_quality, 3),
+        "physiology_confidence": None if physiology_confidence is None else round(physiology_confidence, 3),
         "altitude_penalty": round(altitude_penalty, 3),
         "terrain": terrain_details,
     }
@@ -306,7 +400,71 @@ def _risk_notes(profile: dict[str, object], rows: list[dict[str, object]], gpx_q
         night_source = profile.get("environment", {}).get("night", {}).get("source")
         if night_source == "unavailable":
             notes.append("比赛包含夜间路段，但历史 FIT 缺少可用经纬度，夜间能力使用默认折减。")
+    if any(row.get("physiology", {}).get("temperature_c") is not None for row in rows):
+        temperature_source = str(profile.get("temperature", {}).get("source", "unavailable"))
+        if temperature_source in {"unavailable", "default"}:
+            notes.append("历史 FIT 温度样本不足，本场温度影响使用系统默认曲线，概率区间已考虑较低可信度。")
+        if str(profile.get("heart_rate", {}).get("source", "unavailable")) == "unavailable":
+            notes.append("历史 FIT 心率覆盖不足，未应用个人心率热应激疲劳修正。")
+    calibration = profile.get("temperature", {}).get("calibration", {})
+    if calibration.get("source") == "wrist_relative_only":
+        notes.append("历史温度来自腕表设备，未反推环境气温；个人绝对耐热曲线已停用，本场使用系统默认温度曲线。")
+    elif calibration.get("source") == "historical_weather":
+        notes.append("历史环境温度来自约9–11km再分析天气网格；山区林下、山谷和暴晒路段仍可能与网格气温不同。")
+    if any(row.get("physiology", {}).get("pacing", {}).get("extrapolated") for row in rows):
+        notes.append("目标比赛强度超出部分历史心率样本范围，配速已按历史输出上限限制。")
+    if rows and rows[0].get("physiology", {}).get("pacing", {}).get("strategy") == "aggressive" and not any(
+        row.get("physiology", {}).get("pacing", {}).get("source") == "personal" for row in rows
+    ):
+        notes.append("选择了积极策略，但对应坡度缺少可靠心率—输出样本，未强行提高配速。")
     return notes
+
+
+def _physiology_summary(
+    profile: dict[str, object], condition: RaceCondition, rows: list[dict[str, object]]
+) -> dict[str, object]:
+    temperature = profile.get("temperature", {})
+    heart_rate = profile.get("heart_rate", {})
+    return {
+        "race_temperature_c": condition.temperature_c,
+        "temperature_model_source": str(temperature.get("source", "unavailable")),
+        "temperature_model_confidence": float(temperature.get("confidence", 0.2)),
+        "reference_temperature_c": temperature.get("reference_temperature_c"),
+        "best_temperature_range_c": temperature.get("best_range_c"),
+        "direct_temperature_factor": max(
+            (float(row.get("physiology", {}).get("temperature_direct_factor", 1.0)) for row in rows),
+            default=1.0,
+        ),
+        "maximum_temperature_fatigue_factor": max(
+            (float(row.get("physiology", {}).get("temperature_fatigue_factor", 1.0)) for row in rows),
+            default=1.0,
+        ),
+        "heart_rate_model_source": str(heart_rate.get("source", "unavailable")),
+        "heart_rate_model_confidence": float(heart_rate.get("confidence", 0.2)),
+        "pacing_strategy": condition.pacing_strategy,
+        "pacing_strategy_label": {"conservative": "保守", "standard": "标准", "aggressive": "积极"}.get(condition.pacing_strategy, "标准"),
+        "heart_rate_pacing_applied": any(
+            row.get("physiology", {}).get("pacing", {}).get("source") == "personal" for row in rows
+        ),
+        "target_hr_bpm_range": _pacing_hr_range(rows, "target_hr_bpm"),
+        "expected_hr_bpm_range": _pacing_hr_range(rows, "expected_hr_bpm"),
+        "aerobic_range": heart_rate.get("aerobic_range", {}),
+        "threshold": heart_rate.get("threshold", {}),
+        "expected_hr_drift_at_finish_bpm": round(interpolate_hr_drift(profile, rows[-1]["cumulative_time_seconds"] / 3600.0), 1) if rows else 0.0,
+        "maximum_heart_rate_fatigue_factor": max(
+            (float(row.get("physiology", {}).get("heart_rate_fatigue_factor", 1.0)) for row in rows),
+            default=1.0,
+        ),
+    }
+
+
+def _pacing_hr_range(rows: list[dict[str, object]], field: str) -> list[float] | None:
+    values = [
+        float(row["physiology"]["pacing"][field])
+        for row in rows
+        if row.get("physiology", {}).get("pacing", {}).get(field) is not None
+    ]
+    return [round(min(values), 1), round(max(values), 1)] if values else None
 
 
 def _segment_environment(

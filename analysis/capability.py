@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -12,7 +13,10 @@ from analysis.activity_selection import infer_activity_type
 from analysis.confidence import aggregate_quality_score, calculate_confidence
 from analysis.data_quality import diagnose_fit
 from analysis.fatigue import build_fatigue_profile
+from analysis.heart_rate import build_heart_rate_profile
 from analysis.environment import build_environment_profile
+from analysis.temperature import calibrate_activity_temperature, build_temperature_profile
+from analysis.weather import enrich_activity_with_historical_weather
 from config import load_config
 from models import RunnerProfile
 from parser.gpx_reader import group_terrain_chunks
@@ -30,6 +34,7 @@ DEFAULT_PROFILE = {
 def build_runner_profile(
     activities: dict[str, pd.DataFrame],
     activity_type_overrides: dict[str, str] | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     if not activities:
         raise ValueError("至少需要一个 FIT 活动才能生成能力画像")
@@ -44,7 +49,8 @@ def build_runner_profile(
             raise ValueError(f"活动 {name} 的类型无效：{activity_type}")
         activity_types[name] = activity_type
         quality_reports[name] = diagnose_fit(frame)
-        activity = add_interval_metrics(frame)
+        activity = calibrate_activity_temperature(add_interval_metrics(frame))
+        activity = enrich_activity_with_historical_weather(activity, name, progress)
         activity["_activity_name"] = name
         activity["_activity_type"] = activity_type
         activity["_model_weight"] = _activity_weight(name, activity, activity_type)
@@ -59,6 +65,9 @@ def build_runner_profile(
     uphill["curve"] = _uphill_curve(uphill, quality_score)
     downhill["curve"] = _downhill_curve(downhill, quality_score)
     duration_capabilities = _build_duration_capabilities(segment_frame, flat, uphill, downhill, quality_score)
+    fatigue_profile = build_fatigue_profile(enriched)
+    heart_rate_profile = build_heart_rate_profile(enriched, segment_frame)
+    temperature_profile = build_temperature_profile(enriched, fatigue_profile)
     activity_summaries = []
     for name, frame in activities.items():
         summary = analyze_activity(frame, name)
@@ -66,17 +75,21 @@ def build_runner_profile(
         summary["data_quality"] = quality_reports[name]
         activity_summaries.append(summary)
     profile: dict[str, object] = {
-        "schema_version": "0.2",
+        "schema_version": "0.3",
         "units": {
             "flat_pace": "seconds_per_km",
             "uphill": "vertical_metres_per_hour",
             "downhill_speed": "metres_per_second",
             "fatigue": "retained_performance_ratio",
+            "temperature_effect": "time_multiplier",
+            "heart_rate": "beats_per_minute",
         },
         "flat": flat,
         "uphill": uphill,
         "downhill": downhill,
-        "fatigue": build_fatigue_profile(enriched),
+        "fatigue": fatigue_profile,
+        "temperature": temperature_profile,
+        "heart_rate": heart_rate_profile,
         "environment": build_environment_profile(enriched),
         "duration_capabilities": duration_capabilities,
         "activities": activity_summaries,
@@ -182,11 +195,18 @@ def _activity_terrain_segments(
         cumulative_distance = np.concatenate(([0.0], np.cumsum(distance)))
         cumulative_seconds = np.concatenate(([0.0], np.cumsum(seconds)))
         cumulative_elevation = np.concatenate(([0.0], np.cumsum(elevation)))
+        heart_rate = pd.to_numeric(block.get("heart_rate"), errors="coerce").to_numpy(dtype=float)
+        heart_rate_valid_seconds = np.where(np.isfinite(heart_rate), seconds, 0.0)
+        heart_rate_seconds = np.where(np.isfinite(heart_rate), heart_rate * seconds, 0.0)
+        cumulative_hr_valid = np.concatenate(([0.0], np.cumsum(heart_rate_valid_seconds)))
+        cumulative_hr_seconds = np.concatenate(([0.0], np.cumsum(heart_rate_seconds)))
         edges = np.arange(0.0, total_distance, sample_distance_m)
         if total_distance - edges[-1] > 1e-6:
             edges = np.append(edges, total_distance)
         edge_seconds = np.interp(edges, cumulative_distance, cumulative_seconds)
         edge_elevation = np.interp(edges, cumulative_distance, cumulative_elevation)
+        edge_hr_valid = np.interp(edges, cumulative_distance, cumulative_hr_valid)
+        edge_hr_seconds = np.interp(edges, cumulative_distance, cumulative_hr_seconds)
         terrain_elevation = edge_elevation.copy()
         if len(terrain_elevation) >= 3:
             padded = np.pad(terrain_elevation, (1, 1), mode="edge")
@@ -200,9 +220,16 @@ def _activity_terrain_segments(
                 "elevation_delta": float(elevation_delta),
                 "grade": float(smooth_delta / distance_m * 100.0),
                 "seconds": float(seconds_s),
+                "heart_rate_valid_seconds": float(hr_valid_s),
+                "heart_rate_seconds": float(hr_seconds),
             }
-            for distance_m, seconds_s, elevation_delta, smooth_delta in zip(
-                chunk_distance, chunk_seconds, np.diff(edge_elevation), terrain_delta
+            for distance_m, seconds_s, elevation_delta, smooth_delta, hr_valid_s, hr_seconds in zip(
+                chunk_distance,
+                chunk_seconds,
+                np.diff(edge_elevation),
+                terrain_delta,
+                np.diff(edge_hr_valid),
+                np.diff(edge_hr_seconds),
             )
             if distance_m > 1e-3 and seconds_s > 0
         ]
@@ -212,6 +239,8 @@ def _activity_terrain_segments(
             duration = sum(item["seconds"] for item in selected)
             gain = sum(max(item["elevation_delta"], 0.0) for item in selected)
             loss = sum(max(-item["elevation_delta"], 0.0) for item in selected)
+            heart_rate_duration = sum(item["heart_rate_valid_seconds"] for item in selected)
+            heart_rate_integral = sum(item["heart_rate_seconds"] for item in selected)
             grade = sum(item["grade"] * item["distance"] for item in selected) / segment_distance
             block_start_elapsed_h = max(0.0, (block["timestamp"].iloc[0] - activity_start).total_seconds() / 3600.0)
             segment_start_elapsed_h = block_start_elapsed_h + float(edge_seconds[start]) / 3600.0
@@ -225,6 +254,8 @@ def _activity_terrain_segments(
                     "gain_m": gain,
                     "loss_m": loss,
                     "grade_pct": grade,
+                    "average_hr_bpm": heart_rate_integral / heart_rate_duration if heart_rate_duration > 0 else np.nan,
+                    "heart_rate_duration_s": heart_rate_duration,
                     "pace": duration / segment_distance * 1000.0,
                     "speed_mps": segment_distance / duration,
                     "model_weight": float(block["_model_weight"].iloc[0]),

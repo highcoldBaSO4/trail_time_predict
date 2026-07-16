@@ -27,6 +27,7 @@ def build_activity_review(activities: dict[str, pd.DataFrame]) -> list[dict[str,
         quality = diagnose_fit(frame)
         inferred = infer_activity_type(name, frame)
         timestamps = pd.to_datetime(frame.get("timestamp"), errors="coerce", utc=True).dropna()
+        temperature_range = _temperature_range_text(frame)
         rows.append(
             {
                 "filename": name,
@@ -39,10 +40,33 @@ def build_activity_review(activities: dict[str, pd.DataFrame]) -> list[dict[str,
                 "quality_level": str(quality["level"]),
                 "quality_score": float(quality["score"]),
                 "quality_issues": list(quality["issues"]),
+                "heart_rate_coverage": float(quality.get("heart_rate_coverage", 0.0)),
+                "temperature_coverage": float(quality.get("temperature_coverage", 0.0)),
+                "device_temperature_coverage": float(quality.get("device_temperature_coverage", 0.0)),
+                "temperature_range": temperature_range,
                 "use_for_model": bool(quality["recommended_for_model"]),
             }
         )
     return rows
+
+
+def _temperature_range_text(frame: pd.DataFrame) -> str:
+    ambient = _valid_temperature_values(frame, "temperature", -30.0, 60.0)
+    if not ambient.empty:
+        return f"{float(ambient.min()):g}～{float(ambient.max()):g}℃（环境）"
+    device = _valid_temperature_values(frame, "device_temperature", -30.0, 70.0)
+    if not device.empty:
+        return f"{float(device.min()):g}～{float(device.max()):g}℃（腕表）"
+    return "无有效温度"
+
+
+def _valid_temperature_values(
+    frame: pd.DataFrame, column: str, minimum: float, maximum: float
+) -> pd.Series:
+    if column not in frame.columns:
+        return pd.Series(dtype=float)
+    values = pd.to_numeric(frame[column], errors="coerce")
+    return values[values.between(minimum, maximum)].dropna()
 
 
 def apply_activity_review(

@@ -20,6 +20,8 @@ from analysis.data_quality import diagnose_fit, diagnose_gpx
 from analysis.downhill import interpolate_downhill_speed
 from analysis.environment import build_environment_profile, relative_altitude_factor, solar_elevation_degrees
 from analysis.fatigue import interpolate_fatigue
+from analysis.temperature import calibrate_activity_temperature, _stabilize_temperature_curve
+from analysis import weather
 from analysis.uphill import interpolate_uphill_vam
 from config import load_config
 from models import CapabilityValue, PredictionResult, RaceCondition, RunnerProfile
@@ -42,6 +44,7 @@ def synthetic_activity(points: int = 120, seconds: int = 10) -> pd.DataFrame:
             "heart_rate": 150.0,
             "cadence": 170.0,
             "power": np.nan,
+            "temperature": 20.0,
         }
     )
 
@@ -54,6 +57,11 @@ def test_activity_metrics_and_profile() -> None:
     profile = build_runner_profile({"training.fit": frame})
     assert profile["sample_count"] == 1
     assert profile["uphill"]["5_percent"] > 0
+    uphill_hr = profile["heart_rate"]["terrain_response"]["uphill"]
+    uphill_intensity = profile["heart_rate"]["intensity_output"]["uphill"]
+    assert any(entry["grade_band"] == "uphill_5_10" for entry in uphill_hr)
+    assert any(entry["grade_band"] == "uphill_5_10" for entry in uphill_intensity)
+    assert all("median_speed_mps" in entry for entry in uphill_hr)
 
 
 def test_flat_pace_uses_natural_flat_without_heart_rate() -> None:
@@ -110,6 +118,20 @@ def test_activity_review_requires_one_selected_activity() -> None:
 
     with pytest.raises(ValueError, match="至少选择一个活动"):
         apply_activity_review(activities, rows)
+
+
+def test_activity_review_shows_ambient_or_wrist_temperature_range() -> None:
+    ambient = synthetic_activity(points=3)
+    ambient["temperature"] = [12.0, 15.0, 18.0]
+    wrist = synthetic_activity(points=3)
+    wrist["temperature"] = np.nan
+    wrist["device_temperature"] = [25.0, 27.0, 30.0]
+
+    rows = build_activity_review({"ambient.fit": ambient, "wrist.fit": wrist})
+    by_name = {row["filename"]: row for row in rows}
+
+    assert by_name["ambient.fit"]["temperature_range"] == "12～18℃（环境）"
+    assert by_name["wrist.fit"]["temperature_range"] == "25～30℃（腕表）"
 
 
 def test_profile_and_report_expose_four_slope_bands() -> None:
@@ -190,6 +212,8 @@ def test_fit_reader_converts_path_for_fitparse(monkeypatch, tmp_path: Path) -> N
 
     assert isinstance(received["source"], str)
     assert len(frame) == 1
+    assert "temperature" in frame
+    assert "device_temperature" in frame
 
 
 def test_fit_reader_keeps_records_before_trailing_parse_error(monkeypatch, tmp_path: Path) -> None:
@@ -210,6 +234,103 @@ def test_fit_reader_keeps_records_before_trailing_parse_error(monkeypatch, tmp_p
         frame = fit_reader.read_fit(tmp_path / "partial.fit")
 
     assert len(frame) == 1
+
+
+def test_fit_reader_fills_record_temperature_from_lap_then_session(monkeypatch, tmp_path: Path) -> None:
+    class FakeMessage:
+        def __init__(self, values):
+            self.values = values
+
+        def get_values(self):
+            return self.values
+
+    records = [
+        FakeMessage({"timestamp": pd.Timestamp(f"2026-01-01T00:0{minute}:00Z"), "distance": minute * 100})
+        for minute in range(4)
+    ]
+    laps = [
+        FakeMessage({
+            "start_time": pd.Timestamp("2026-01-01T00:00:00Z"),
+            "timestamp": pd.Timestamp("2026-01-01T00:01:00Z"),
+            "avg_temperature": 29,
+        })
+    ]
+    sessions = [FakeMessage({"avg_temperature": 30, "sport": "running"})]
+
+    class FakeFitFile:
+        def __init__(self, source, check_crc=True):
+            pass
+
+        def get_messages(self, message_type):
+            return {"record": records, "lap": laps, "session": sessions}.get(message_type, [])
+
+    monkeypatch.setattr(fit_reader, "FitFile", FakeFitFile)
+    frame = fit_reader.read_fit(tmp_path / "activity.fit")
+
+    assert frame["temperature"].isna().all()
+    assert frame["temperature_weight"].tolist() == [0.65, 0.65, 0.35, 0.35]
+    assert frame["device_temperature"].tolist() == [29.0, 29.0, 30.0, 30.0]
+    assert frame.attrs["temperature_source"] == "lap_average+session_average"
+
+
+def test_wrist_temperature_is_relative_only_and_not_used_as_ambient() -> None:
+    frame = synthetic_activity()
+    frame["device_temperature"] = 30.0
+    frame["temperature"] = 30.0
+    frame["temperature_weight"] = 1.0
+    frame["latitude"] = np.nan
+    frame["longitude"] = np.nan
+
+    calibrated = calibrate_activity_temperature(frame)
+    profile = build_runner_profile({"wrist.fit": frame})
+
+    assert pd.isna(calibrated["temperature"].iloc[0])
+    assert calibrated["device_temperature"].iloc[0] == 30.0
+    assert calibrated["temperature_weight"].iloc[0] == 0.0
+    assert calibrated["device_temperature_relative"].iloc[0] == 0.0
+    assert profile["temperature"]["coverage"]["maximum_c"] is None
+    assert profile["temperature"]["coverage"]["device_maximum_c"] == 30.0
+    assert profile["temperature"]["calibration"]["source"] == "wrist_relative_only"
+    assert profile["temperature"]["source"] == "unavailable"
+
+
+def test_historical_weather_becomes_ambient_temperature_without_overwriting_wrist_data(monkeypatch) -> None:
+    frame = synthetic_activity(points=13, seconds=10)
+    frame["device_temperature"] = 31.0
+    frame["temperature"] = np.nan
+    frame["temperature_weight"] = 0.0
+    calibrated = calibrate_activity_temperature(frame)
+    payload = {
+        "hourly": {
+            "time": ["2026-01-01T00:00", "2026-01-01T01:00"],
+            "temperature_2m": [20.0, 22.0],
+            "apparent_temperature": [19.0, 21.0],
+            "relative_humidity_2m": [70.0, 65.0],
+            "precipitation": [0.0, 0.0],
+            "wind_speed_10m": [2.0, 3.0],
+            "wind_gusts_10m": [4.0, 5.0],
+            "shortwave_radiation": [0.0, 800.0],
+            "direct_radiation": [0.0, 5.0],
+        }
+    }
+    monkeypatch.setattr(weather, "_weather_payload", lambda representatives, timestamps, config: (payload, True))
+
+    enriched = weather.enrich_activity_with_historical_weather(calibrated, "weather.fit")
+
+    assert enriched["temperature"].between(20.0, 22.0).all()
+    assert enriched["temperature_weight"].between(0.4875, 0.75).all()
+    assert enriched["temperature_weight"].max() == 0.75
+    assert enriched["temperature_weight"].min() < 0.75
+    assert enriched["local_heat_exposure_index"].between(0.0, 1.0).all()
+    assert enriched["device_temperature"].eq(31.0).all()
+    assert enriched["device_temperature_relative"].eq(0.0).all()
+    assert enriched.attrs["temperature_calibration"]["source"] == "historical_weather"
+    assert enriched.attrs["temperature_calibration"]["local_exposure_weight_adjustment"] is True
+    assert enriched.attrs["historical_weather"]["status"] == "cache"
+
+    recalibrated = calibrate_activity_temperature(enriched)
+    assert recalibrated["temperature"].equals(enriched["temperature"])
+    assert recalibrated["temperature_weight"].equals(enriched["temperature_weight"])
 
 
 def test_config_and_typed_capability_model() -> None:
@@ -264,7 +385,7 @@ def test_solar_position_and_historical_environment_profile() -> None:
 
 def test_profile_exposes_quality_confidence_and_continuous_curves() -> None:
     profile = build_runner_profile({"training.fit": synthetic_activity()})
-    assert profile["schema_version"] == "0.2"
+    assert profile["schema_version"] == "0.3"
     assert 0 <= profile["flat"]["confidence"] <= 1
     assert len(profile["uphill"]["curve"]) == 4
     assert len(profile["downhill"]["curve"]) == 4
@@ -288,6 +409,9 @@ def test_runner_profile_typed_round_trip_and_missing_fields() -> None:
 
 def test_runner_profile_typed_model_upgrades_legacy_curves() -> None:
     legacy = build_runner_profile({"training.fit": synthetic_activity()})
+    legacy["schema_version"] = "0.2"
+    legacy.pop("temperature")
+    legacy.pop("heart_rate")
     legacy["uphill"].pop("curve")
     legacy["downhill"].pop("curve")
     for terrain in ("flat", "uphill", "downhill"):
@@ -299,6 +423,117 @@ def test_runner_profile_typed_model_upgrades_legacy_curves() -> None:
     assert len(upgraded["downhill"]["curve"]) == 4
     assert upgraded["fatigue"]["flat"][2]["factor"] == legacy["fatigue"]["5h"]
     assert upgraded["uphill"]["curve"][0]["source"] == "legacy"
+    assert upgraded["schema_version"] == "0.3"
+    assert upgraded["temperature"] == {}
+    assert upgraded["heart_rate"] == {}
+
+
+def test_v03_builds_temperature_and_heart_rate_profiles() -> None:
+    cool = synthetic_activity(points=481, seconds=60)
+    hot = synthetic_activity(points=481, seconds=60)
+    for frame, step, start_temperature in ((cool, 50.0, 13.0), (hot, 45.0, 28.0)):
+        frame["distance"] = np.arange(len(frame), dtype=float) * step
+        frame["altitude"] = 100.0
+        frame["temperature"] = np.linspace(start_temperature, start_temperature + 4.0, len(frame))
+        frame["heart_rate"] = np.linspace(140.0, 160.0, len(frame))
+
+    profile = build_runner_profile(
+        {
+            "cool-a.fit": cool,
+            "cool-b.fit": cool.copy(),
+            "hot-a.fit": hot,
+            "hot-b.fit": hot.copy(),
+        }
+    )
+    temperature_curve = {float(point["temperature_c"]): point for point in profile["temperature"]["curve"]}
+    drift = profile["heart_rate"]["drift"]["overall"]
+
+    assert profile["temperature"]["source"] == "personal_blend"
+    assert 10.0 in temperature_curve
+    assert profile["temperature"]["best_range_c"] == [10.0, 20.0]
+    assert temperature_curve[-5.0]["time_factor"] == 1.06
+    assert temperature_curve[-5.0]["source"] == "default"
+    assert temperature_curve[10.0]["time_factor"] == 1.0
+    assert temperature_curve[15.0]["time_factor"] == 1.0
+    assert temperature_curve[20.0]["time_factor"] == 1.0
+    assert temperature_curve[30.0]["time_factor"] >= temperature_curve[20.0]["time_factor"]
+    assert profile["heart_rate"]["source"] == "personal"
+    assert drift[-1]["drift_bpm"] > 0
+    assert profile["heart_rate"]["heat_sensitivity"]["source"] == "personal"
+
+
+def test_temperature_stabilization_does_not_propagate_one_cold_node() -> None:
+    curve = [
+        {"temperature_c": -5.0, "time_factor": 1.06, "default_time_factor": 1.06, "source": "default"},
+        {"temperature_c": 5.0, "time_factor": 1.237, "default_time_factor": 1.02, "source": "personal_blend"},
+        {"temperature_c": 10.0, "time_factor": 1.0, "default_time_factor": 1.0, "source": "comfort_anchor"},
+        {"temperature_c": 15.0, "time_factor": 1.0, "default_time_factor": 1.0, "source": "comfort_anchor"},
+        {"temperature_c": 20.0, "time_factor": 1.0, "default_time_factor": 1.0, "source": "comfort_anchor"},
+    ]
+
+    _stabilize_temperature_curve(curve, 10.0, 20.0, {"maximum_personal_factor_adjustment": 0.05})
+
+    assert curve[0]["time_factor"] == 1.06
+    assert curve[1]["time_factor"] == 1.06
+    assert [point["time_factor"] for point in curve[2:]] == [1.0, 1.0, 1.0]
+
+
+def test_v03_temperature_and_hr_fatigue_are_explainable() -> None:
+    cool = synthetic_activity(points=481, seconds=60)
+    hot = synthetic_activity(points=481, seconds=60)
+    for frame, step, start_temperature in ((cool, 50.0, 13.0), (hot, 45.0, 28.0)):
+        frame["distance"] = np.arange(len(frame), dtype=float) * step
+        frame["altitude"] = 100.0
+        frame["temperature"] = np.linspace(start_temperature, start_temperature + 4.0, len(frame))
+        frame["heart_rate"] = np.linspace(140.0, 160.0, len(frame))
+    profile = build_runner_profile({"cool.fit": cool, "hot.fit": hot})
+    segments = [{"distance": 100000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
+                 "type": "flat", "start_km": 0.0, "end_km": 100.0}]
+
+    prediction = predict_race(
+        profile, segments, condition=RaceCondition(temperature_c=30.0), simulations=1000, seed=53
+    )
+    row = prediction["segments"][0]
+    report = build_markdown_report(profile, prediction)
+
+    assert row["condition_factors"]["temperature_fatigue"] > 1.0
+    assert row["condition_factors"]["heart_rate_fatigue"] >= 1.0
+    assert prediction["physiology"]["temperature_model_source"] == "personal_blend"
+    assert "个人温度耐受" in report
+    assert "心率响应与漂移" in report
+    assert "高温后程疲劳" in report
+
+
+def test_heart_rate_intensity_strategy_uses_historical_output_with_guards() -> None:
+    activities = {}
+    for name, heart_rate, step in (
+        ("easy.fit", 135.0, 35.0),
+        ("steady.fit", 150.0, 42.0),
+        ("hard.fit", 165.0, 48.0),
+    ):
+        frame = synthetic_activity(points=181, seconds=10)
+        frame["distance"] = np.arange(len(frame), dtype=float) * step
+        frame["altitude"] = 100.0
+        frame["heart_rate"] = heart_rate
+        activities[name] = frame
+    profile = build_runner_profile(activities)
+    segments = [{"distance": 10000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
+                 "type": "flat", "start_km": 0.0, "end_km": 10.0}]
+
+    conservative = predict_race(
+        profile, segments, condition=RaceCondition(pacing_strategy="conservative"),
+        simulations=1000, seed=61,
+    )
+    aggressive = predict_race(
+        profile, segments, condition=RaceCondition(pacing_strategy="aggressive"),
+        simulations=1000, seed=61,
+    )
+
+    assert profile["heart_rate"]["intensity_output"]["flat"]
+    assert aggressive["segments"][0]["physiology"]["pacing"]["source"] == "personal"
+    assert aggressive["adjusted_moving_time_seconds"] <= conservative["adjusted_moving_time_seconds"]
+    assert aggressive["physiology"]["pacing_strategy_label"] == "积极"
+    assert "心率强度配速" in build_markdown_report(profile, aggressive)
 
 
 def test_profile_exposes_duration_capability_layers() -> None:

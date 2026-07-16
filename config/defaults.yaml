@@ -57,6 +57,22 @@ environment:
     minimum_relative_factor: 0.90
     maximum_relative_factor: 1.30
 
+historical_weather:
+  endpoint: https://archive-api.open-meteo.com/v1/archive
+  cache_directory: data/weather_cache
+  timeout_seconds: 20.0
+  representative_distance_km: 10.0
+  representative_elevation_change_m: 400.0
+  maximum_representative_points: 20
+  skip_when_ambient_coverage: 0.80
+  model_weight: 0.75
+  local_exposure:
+    solar_reference_wm2: 800.0
+    wrist_relative_reference_c: 6.0
+    solar_share: 0.60
+    wrist_share: 0.40
+    maximum_weight_reduction: 0.35
+
 duration_capability:
   layers:
     - {name: short, label: 短时, min_hours: 0.0, max_hours: 2.0, center_hours: 1.0, fallback_time_factor: 0.96}
@@ -88,6 +104,67 @@ conditions:
     humidity_threshold_percent: 70.0
     humidity_per_percent: 0.001
 
+heart_rate_model:
+  valid_min_bpm: 60.0
+  valid_max_bpm: 220.0
+  stable_window_seconds: 120
+  minimum_stable_window_seconds: 60.0
+  maximum_output_cv: 0.45
+  threshold_percentile: 95.0
+  intensity_zones:
+    easy: {min_ratio: 0.00, max_ratio: 0.82}
+    aerobic: {min_ratio: 0.82, max_ratio: 0.89}
+    steady: {min_ratio: 0.89, max_ratio: 0.95}
+    threshold: {min_ratio: 0.95, max_ratio: 1.02}
+    high: {min_ratio: 1.02, max_ratio: 1.20}
+  race_intensity_targets:
+    - {max_hours: 2.0, conservative: 0.90, standard: 0.95, aggressive: 0.99}
+    - {max_hours: 5.0, conservative: 0.86, standard: 0.91, aggressive: 0.95}
+    - {max_hours: 8.0, conservative: 0.82, standard: 0.87, aggressive: 0.91}
+    - {max_hours: 12.0, conservative: 0.78, standard: 0.83, aggressive: 0.87}
+    - {max_hours: null, conservative: 0.74, standard: 0.79, aggressive: 0.83}
+  strategy_output_limits:
+    conservative: {min: 0.90, max: 1.00, downhill_max: 1.00}
+    standard: {min: 0.95, max: 1.06, downhill_max: 1.01}
+    aggressive: {min: 0.98, max: 1.12, downhill_max: 1.03}
+  drift_hours: [0.0, 3.0, 5.0, 8.0]
+  minimum_activity_hours_for_drift: 2.0
+  expected_drift_bpm_at_5h: 6.0
+  default_heat_sensitivity_bpm_per_degree: 0.30
+  maximum_heat_sensitivity_bpm_per_degree: 1.20
+  heat_drift_time_factor_scale: 0.010
+  maximum_heat_drift_time_factor: 1.08
+
+temperature_model:
+  valid_min_c: -30.0
+  valid_max_c: 60.0
+  comfort_min_c: 10.0
+  comfort_max_c: 20.0
+  wrist_relative:
+    warmup_minutes: 30.0
+  nodes_c: [-5.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 35.0, 40.0]
+  default_curve:
+    - {temperature_c: -5.0, time_factor: 1.06}
+    - {temperature_c: 5.0, time_factor: 1.02}
+    - {temperature_c: 10.0, time_factor: 1.00}
+    - {temperature_c: 15.0, time_factor: 1.00}
+    - {temperature_c: 20.0, time_factor: 1.00}
+    - {temperature_c: 25.0, time_factor: 1.02}
+    - {temperature_c: 30.0, time_factor: 1.05}
+    - {temperature_c: 35.0, time_factor: 1.09}
+    - {temperature_c: 40.0, time_factor: 1.15}
+  minimum_personal_activities: 2
+  minimum_personal_duration_minutes: 60.0
+  node_evidence:
+    minimum_activities: 2
+    full_activities: 3
+    minimum_duration_minutes: 60.0
+    full_duration_minutes: 180.0
+  maximum_personal_factor_adjustment: 0.05
+  fatigue_threshold_above_reference_c: 5.0
+  fatigue_time_increase_per_degree_hour: 0.0008
+  maximum_fatigue_time_factor: 1.12
+
 monte_carlo:
   simulations: 3000
   min_simulations: 1000
@@ -100,6 +177,7 @@ monte_carlo:
   condition_activation_reference: 0.10
   condition_terrain_correlation: 0.85
   condition_source_sigma:
+    heart_rate_pacing: 0.030
     form: 0.025
     technical: 0.035
     mud: 0.040
@@ -107,6 +185,8 @@ monte_carlo:
     altitude: 0.030
     carried_weight: 0.025
     weather: 0.035
+    temperature_fatigue: 0.030
+    heart_rate_fatigue: 0.030
   gpx_sigma_high_quality: 0.01
   gpx_sigma_low_quality: 0.06
   gpx_segment_correlation: 0.55
