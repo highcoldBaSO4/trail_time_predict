@@ -137,8 +137,10 @@ def test_activity_review_shows_ambient_or_wrist_temperature_range() -> None:
 def test_profile_and_report_expose_four_slope_bands() -> None:
     profile = build_runner_profile({"training.fit": synthetic_activity()})
 
-    assert {"1_percent", "5_percent", "10_percent", "15_percent"} <= set(profile["uphill"])
-    assert {"-1_percent", "-5_percent", "-10_percent", "-15_percent"} <= set(profile["downhill"])
+    assert {"1_percent", "5_percent", "10_percent", "15_percent", "20_percent"} <= set(profile["uphill"])
+    assert {"-1_percent", "-5_percent", "-10_percent", "-15_percent", "-20_percent"} <= set(profile["downhill"])
+    assert len(profile["uphill"]["curve"]) == 5
+    assert len(profile["downhill"]["curve"]) == 5
 
     gpx = """<gpx version="1.1" creator="test" xmlns="http://www.topografix.com/GPX/1/1">
       <trk><trkseg><trkpt lat="0" lon="0"><ele>0</ele></trkpt>
@@ -172,6 +174,8 @@ def test_gpx_segmentation_prediction_and_report() -> None:
     assert summary["climbs"] == 1
     assert summary["descents"] == 1
     assert {"latitude", "longitude", "elevation", "elevation_available"} <= set(segments[0])
+    assert summary["micro_segments"] > len(segments)
+    assert segments[0]["micro_segments"]
 
     profile = build_runner_profile({"training.fit": synthetic_activity()})
     prediction = predict_race(profile, segments, aid_minutes=10)
@@ -191,6 +195,21 @@ def test_segmentation_groups_a_continuous_slope_as_one_natural_climb() -> None:
     assert len(segments) == 1
     assert segments[0]["type"] == "uphill"
     assert 1.99 < float(segments[0]["distance"]) / 1000.0 < 2.01
+
+
+def test_gpx_micro_segments_preserve_visible_undulations() -> None:
+    step_lon = 25.0 / 111_194.9266
+    elevations = [100.0, 108.0, 108.0, 104.0, 104.0, 112.0, 112.0, 108.0, 108.0, 118.0, 118.0]
+    points = [
+        {"latitude": 0.0, "longitude": index * step_lon, "elevation": elevation}
+        for index, elevation in enumerate(elevations)
+    ]
+    segments = build_race_segments(points, 100.0)
+    summary = route_summary(segments)
+
+    assert summary["micro_segments"] >= 8
+    assert float(summary["elevation_gain"]) > elevations[-1] - elevations[0]
+    assert float(summary["elevation_loss"]) > 0.0
 
 
 def test_fit_reader_converts_path_for_fitparse(monkeypatch, tmp_path: Path) -> None:
@@ -566,6 +585,24 @@ def test_phase2_prediction_conditions_and_probability_order() -> None:
     report = build_markdown_report(profile, difficult)
     assert "概率区间依据" in report
     assert "疲劳可信度" in report
+
+
+def test_easier_and_drier_conditions_can_reduce_time() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    segments = [{"distance": 1000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
+                 "type": "flat", "terrain": "平路", "elevation_available": True}]
+    baseline = predict_race(profile, segments, simulations=1000, seed=17)
+    easier = predict_race(
+        profile,
+        segments,
+        condition=RaceCondition(terrain_technical_level=-2, mud_level=-2),
+        simulations=1000,
+        seed=17,
+    )
+
+    assert easier["adjusted_moving_time_seconds"] < baseline["adjusted_moving_time_seconds"]
+    assert easier["adjustment_breakdown"]["technical"] < 0
+    assert easier["adjustment_breakdown"]["mud"] < 0
 
 
 def test_phase2_monte_carlo_is_reproducible() -> None:

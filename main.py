@@ -9,6 +9,7 @@ from analysis.capability import build_runner_profile, save_runner_profile
 from parser.fit_reader import read_fit_directory
 from parser.gpx_reader import build_race_segments, read_gpx, save_segments
 from analysis.data_quality import diagnose_gpx
+from elevation_chart import save_elevation_chart
 from models import RaceCondition
 from predictor.race_predictor import format_duration, predict_race, save_prediction
 from predictor.report import build_markdown_report, save_markdown_report
@@ -38,7 +39,8 @@ def run_pipeline(
     _emit(progress, f"    GPX 数据质量：{gpx_quality['level']}（{float(gpx_quality['score']):.0%}）")
     _emit(progress, f"    GPX 读取完成，共 {len(points):,} 个轨迹点；正在按 {segment_distance_m:g} 米分段……")
     segments = build_race_segments(points, segment_distance_m)
-    _emit(progress, f"    路线分段完成，共 {len(segments):,} 段")
+    micro_count = sum(len(list(segment.get("micro_segments", []))) for segment in segments)
+    _emit(progress, f"    路线分段完成，共 {len(segments):,} 个自然地形段、{micro_count:,} 个计时微分段")
     save_segments(segments, output / "race_segments.json")
 
     _emit(progress, f"[4/5] 正在预测 {len(segments)} 个路线分段……")
@@ -57,24 +59,6 @@ def _emit(progress: Callable[[str], None] | None, message: str) -> None:
         progress(message)
 
 
-def save_elevation_chart(segments: list[dict[str, object]], path: str | Path) -> None:
-    import matplotlib.pyplot as plt
-
-    distances = [0.0]
-    elevations = [0.0]
-    for segment in segments:
-        distances.append(float(segment["end_km"]))
-        elevations.append(elevations[-1] + float(segment["gain"]) - float(segment["loss"]))
-    figure, axis = plt.subplots(figsize=(10, 3.5))
-    axis.plot(distances, elevations, color="#d95f02", linewidth=2)
-    axis.fill_between(distances, elevations, min(elevations), color="#fdb863", alpha=0.35)
-    axis.set(xlabel="Distance (km)", ylabel="Relative elevation (m)", title="Race elevation profile")
-    axis.grid(alpha=0.2)
-    figure.tight_layout()
-    figure.savefig(path, dpi=150)
-    plt.close(figure)
-
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="越野跑比赛时间概率预测 V0.3")
     parser.add_argument("--activities", default="data/activities", help="历史 FIT 文件目录")
@@ -86,8 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pacing-strategy", choices=["conservative", "standard", "aggressive"], default="standard", help="比赛强度策略")
     parser.add_argument("--temperature", type=float, default=None, help="比赛温度（摄氏度）")
     parser.add_argument("--humidity", type=float, default=None, help="相对湿度百分比")
-    parser.add_argument("--technical-level", type=int, choices=range(5), default=0, help="技术难度 0-4")
-    parser.add_argument("--mud-level", type=int, choices=range(5), default=0, help="泥泞等级 0-4")
+    parser.add_argument("--technical-level", type=int, choices=range(-4, 5), default=0, help="相对平时的技术难度 -4 至 4")
+    parser.add_argument("--mud-level", type=int, choices=range(-4, 5), default=0, help="相对平时的泥泞程度 -4 至 4")
     parser.add_argument("--night-ratio", type=float, default=0.0, help="夜间路段比例 0-1")
     parser.add_argument("--altitude-factor", type=float, default=1.0, help="高海拔耗时系数")
     parser.add_argument("--carried-weight", type=float, default=0.0, help="相对日常训练额外携带重量（kg）")

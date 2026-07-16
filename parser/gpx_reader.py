@@ -41,7 +41,7 @@ def read_gpx(source: str | Path | TextIO) -> list[dict[str, float | None]]:
 
 def build_race_segments(
     points: list[dict[str, float | None]], segment_distance_m: float = 100.0
-) -> list[dict[str, float | str]]:
+) -> list[dict[str, object]]:
     """Detect natural climbs, descents and flats from distance-sampled terrain.
 
     ``segment_distance_m`` is the grade sampling window, not the final segment
@@ -50,25 +50,34 @@ def build_race_segments(
     """
     if segment_distance_m <= 0:
         raise ValueError("分段距离必须大于 0")
-    chunks = _terrain_chunks(points, segment_distance_m)
+    detail_distance_m = segment_distance_m / max(2, math.ceil(segment_distance_m / 25.0))
+    sampled = _sample_route(points, detail_distance_m)
+    detail_chunks = _chunks_from_samples(sampled)
+    chunks = _resample_chunks(sampled, segment_distance_m)
     groups = group_terrain_chunks(chunks, segment_distance_m)
 
-    segments: list[dict[str, float | str]] = []
+    segments: list[dict[str, object]] = []
     counters = {"uphill": 0, "downhill": 0, "flat": 0}
     for start_index, end_index, segment_type in groups:
         selected = chunks[start_index:end_index]
-        distance = sum(float(item["distance"]) for item in selected)
-        gain = sum(max(float(item["elevation_delta"]), 0.0) for item in selected)
-        loss = sum(max(-float(item["elevation_delta"]), 0.0) for item in selected)
-        grade_values = [float(item["grade"]) for item in selected]
-        # Use the smoothed terrain grade for classification, display and
-        # capability matching. Raw sampled elevation remains responsible for
-        # gain/loss totals so smoothing does not erase vertical metres.
-        grade = sum(float(item["grade"]) * float(item["distance"]) for item in selected) / distance
-        latitude = sum(float(item["latitude"]) * float(item["distance"]) for item in selected) / distance
-        longitude = sum(float(item["longitude"]) * float(item["distance"]) for item in selected) / distance
-        elevation = sum(float(item["elevation"]) * float(item["distance"]) for item in selected) / distance
-        elevation_available = all(bool(item["elevation_available"]) for item in selected)
+        start_m = float(selected[0]["start_m"])
+        end_m = float(selected[-1]["end_m"])
+        micro = [
+            _micro_segment(item)
+            for item in detail_chunks
+            if float(item["start_m"]) >= start_m - 1e-6 and float(item["end_m"]) <= end_m + 1e-6
+        ]
+        if not micro:
+            micro = [_micro_segment(item) for item in selected]
+        distance = sum(float(item["distance"]) for item in micro)
+        gain = sum(float(item["gain"]) for item in micro)
+        loss = sum(float(item["loss"]) for item in micro)
+        grade_values = [float(item["grade"]) for item in micro]
+        grade = sum(float(item["grade"]) * float(item["distance"]) for item in micro) / distance
+        latitude = sum(float(item["latitude"]) * float(item["distance"]) for item in micro) / distance
+        longitude = sum(float(item["longitude"]) * float(item["distance"]) for item in micro) / distance
+        elevation = sum(float(item["elevation"]) * float(item["distance"]) for item in micro) / distance
+        elevation_available = all(bool(item["elevation_available"]) for item in micro)
         counters[segment_type] += 1
         max_grade = max(grade_values) if segment_type == "uphill" else min(grade_values) if segment_type == "downhill" else max(grade_values, key=abs)
         segments.append(
@@ -88,6 +97,7 @@ def build_race_segments(
                 "elevation_available": elevation_available,
                 "type": segment_type,
                 "terrain": _terrain_label(segment_type, grade),
+                "micro_segments": micro,
             }
         )
     if not segments:
@@ -95,8 +105,16 @@ def build_race_segments(
     return segments
 
 
-def route_summary(segments: list[dict[str, float | str]]) -> dict[str, float | int]:
-    elevations = [float(item["elevation"]) for item in segments if bool(item.get("elevation_available", False))]
+def route_summary(segments: list[dict[str, object]]) -> dict[str, float | int]:
+    elevations = [
+        float(micro[key])
+        for item in segments
+        for micro in list(item.get("micro_segments", []))
+        for key in ("elevation_start", "elevation_end")
+        if bool(micro.get("elevation_available", False))
+    ]
+    if not elevations:
+        elevations = [float(item["elevation"]) for item in segments if bool(item.get("elevation_available", False))]
     weighted_distance = sum(float(item["distance"]) for item in segments if bool(item.get("elevation_available", False)))
     return {
         "distance_km": round(sum(float(item["distance"]) for item in segments) / 1000.0, 3),
@@ -104,6 +122,7 @@ def route_summary(segments: list[dict[str, float | str]]) -> dict[str, float | i
         "elevation_loss": round(sum(float(item["loss"]) for item in segments), 1),
         "climbs": sum(item["type"] == "uphill" for item in segments),
         "descents": sum(item["type"] == "downhill" for item in segments),
+        "micro_segments": sum(len(list(item.get("micro_segments", []))) for item in segments),
         "average_elevation_m": round(
             sum(float(item["elevation"]) * float(item["distance"]) for item in segments if bool(item.get("elevation_available", False)))
             / weighted_distance,
@@ -116,6 +135,12 @@ def route_summary(segments: list[dict[str, float | str]]) -> dict[str, float | i
 def _terrain_chunks(
     points: list[dict[str, float | None]], sample_distance_m: float
 ) -> list[dict[str, float]]:
+    return _chunks_from_samples(_sample_route(points, sample_distance_m))
+
+
+def _sample_route(
+    points: list[dict[str, float | None]], sample_distance_m: float
+) -> dict[str, object]:
     cumulative = [0.0]
     elevations: list[float] = []
     for point in points:
@@ -151,15 +176,46 @@ def _terrain_chunks(
     if distance_array[-1] - sample_edges[-1] > 1e-6:
         sample_edges = np.append(sample_edges, distance_array[-1])
     sampled_elevation = np.interp(sample_edges, distance_array, elevation_array)
+    if elevation_available and len(sampled_elevation) >= 3:
+        padded = np.pad(sampled_elevation, (1, 1), mode="edge")
+        sampled_elevation = np.asarray([
+            float(np.median(padded[index:index + 3])) for index in range(len(sampled_elevation))
+        ])
     sampled_latitude = np.interp(sample_edges, distance_array, latitude_array)
     sampled_longitude = np.interp(sample_edges, distance_array, longitude_array)
-    terrain_elevation = sampled_elevation.copy()
-    if len(terrain_elevation) >= 3:
-        padded = np.pad(terrain_elevation, (1, 1), mode="edge")
-        terrain_elevation = np.convolve(padded, np.ones(3) / 3.0, mode="valid")
+    return {
+        "distance": sample_edges,
+        "elevation": sampled_elevation,
+        "latitude": sampled_latitude,
+        "longitude": sampled_longitude,
+        "elevation_available": elevation_available,
+    }
+
+
+def _resample_chunks(sampled: dict[str, object], sample_distance_m: float) -> list[dict[str, float]]:
+    detail_distance = np.asarray(sampled["distance"], dtype=float)
+    edges = np.arange(0.0, detail_distance[-1], sample_distance_m)
+    if detail_distance[-1] - edges[-1] > 1e-6:
+        edges = np.append(edges, detail_distance[-1])
+    coarse = {
+        "distance": edges,
+        "elevation": np.interp(edges, detail_distance, np.asarray(sampled["elevation"], dtype=float)),
+        "latitude": np.interp(edges, detail_distance, np.asarray(sampled["latitude"], dtype=float)),
+        "longitude": np.interp(edges, detail_distance, np.asarray(sampled["longitude"], dtype=float)),
+        "elevation_available": bool(sampled["elevation_available"]),
+    }
+    return _chunks_from_samples(coarse)
+
+
+def _chunks_from_samples(sampled: dict[str, object]) -> list[dict[str, float]]:
+    sample_edges = np.asarray(sampled["distance"], dtype=float)
+    sampled_elevation = np.asarray(sampled["elevation"], dtype=float)
+    sampled_latitude = np.asarray(sampled["latitude"], dtype=float)
+    sampled_longitude = np.asarray(sampled["longitude"], dtype=float)
+    elevation_available = bool(sampled["elevation_available"])
 
     chunks: list[dict[str, float]] = []
-    for start_m, end_m, start_elev, end_elev, start_lat, end_lat, start_lon, end_lon, terrain_start, terrain_end in zip(
+    for start_m, end_m, start_elev, end_elev, start_lat, end_lat, start_lon, end_lon in zip(
         sample_edges,
         sample_edges[1:],
         sampled_elevation,
@@ -168,27 +224,48 @@ def _terrain_chunks(
         sampled_latitude[1:],
         sampled_longitude,
         sampled_longitude[1:],
-        terrain_elevation,
-        terrain_elevation[1:],
     ):
         distance = float(end_m - start_m)
         elevation_delta = float(end_elev - start_elev)
-        terrain_delta = float(terrain_end - terrain_start)
         if distance > 1e-3:
             chunks.append(
                 {
                     "start_m": float(start_m),
                     "end_m": float(end_m),
+                    "start_elevation": float(start_elev),
+                    "end_elevation": float(end_elev),
                     "distance": distance,
                     "elevation_delta": elevation_delta,
                     "elevation": float((start_elev + end_elev) / 2.0),
                     "elevation_available": elevation_available,
                     "latitude": float((start_lat + end_lat) / 2.0),
                     "longitude": float((start_lon + end_lon) / 2.0),
-                    "grade": terrain_delta / distance * 100.0,
+                    "grade": elevation_delta / distance * 100.0,
                 }
             )
     return chunks
+
+
+def _micro_segment(chunk: dict[str, float]) -> dict[str, object]:
+    grade = float(chunk["grade"])
+    segment_type = _terrain_type(grade)
+    delta = float(chunk["elevation_delta"])
+    return {
+        "start_km": round(float(chunk["start_m"]) / 1000.0, 4),
+        "end_km": round(float(chunk["end_m"]) / 1000.0, 4),
+        "distance": round(float(chunk["distance"]), 2),
+        "gain": round(max(delta, 0.0), 2),
+        "loss": round(max(-delta, 0.0), 2),
+        "grade": round(grade, 2),
+        "latitude": round(float(chunk["latitude"]), 6),
+        "longitude": round(float(chunk["longitude"]), 6),
+        "elevation": round(float(chunk["elevation"]), 1),
+        "elevation_start": round(float(chunk["start_elevation"]), 1),
+        "elevation_end": round(float(chunk["end_elevation"]), 1),
+        "elevation_available": bool(chunk["elevation_available"]),
+        "type": segment_type,
+        "terrain": _terrain_label(segment_type, grade),
+    }
 
 
 def _terrain_type(grade: float) -> str:
@@ -246,11 +323,14 @@ def _remove_insignificant_slopes(
 
 def _terrain_label(segment_type: str, grade: float) -> str:
     magnitude = abs(grade)
-    level = "微" if magnitude < 5 else "缓" if magnitude < 10 else "中" if magnitude < 15 else "陡"
+    level = (
+        "微" if magnitude < 5 else "缓" if magnitude < 10 else
+        "中" if magnitude < 15 else "较陡" if magnitude < 20 else "陡"
+    )
     return "平路" if segment_type == "flat" else f"{level}{'爬坡' if segment_type == 'uphill' else '下降'}"
 
 
-def save_segments(segments: list[dict[str, float | str]], path: str | Path) -> None:
+def save_segments(segments: list[dict[str, object]], path: str | Path) -> None:
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(segments, ensure_ascii=False, indent=2), encoding="utf-8")

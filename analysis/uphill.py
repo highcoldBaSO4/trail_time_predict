@@ -4,7 +4,12 @@ import numpy as np
 import pandas as pd
 
 
-UPHILL_BINS = ((5.0, 10.0, "5_percent"), (10.0, 15.0, "10_percent"), (15.0, 61.0, "15_percent"))
+UPHILL_BINS = (
+    (5.0, 10.0, "5_percent"),
+    (10.0, 15.0, "10_percent"),
+    (15.0, 20.0, "15_percent"),
+    (20.0, 61.0, "20_percent"),
+)
 
 
 def interpolate_uphill_vam(grade: float, points: list[tuple[float, float]]) -> float:

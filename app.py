@@ -16,6 +16,7 @@ from analysis.activity_selection import ACTIVITY_TYPE_LABELS, LABEL_TO_ACTIVITY_
 from analysis.data_quality import diagnose_gpx
 from analysis.temperature import calibrate_activity_temperature
 from analysis.weather import enrich_activity_with_historical_weather
+from elevation_chart import elevation_figure
 from models import RaceCondition
 from parser.fit_reader import read_fit
 from parser.gpx_reader import build_race_segments, read_gpx
@@ -31,11 +32,13 @@ HEART_RATE_GRADE_BANDS = (
     ("uphill", "uphill_2_5", "微坡", ">2%～5%"),
     ("uphill", "uphill_5_10", "缓坡", "5%～10%"),
     ("uphill", "uphill_10_15", "中坡", "10%～15%"),
-    ("uphill", "uphill_15_plus", "陡坡", "≥15%"),
+    ("uphill", "uphill_15_20", "较陡坡", "15%～20%"),
+    ("uphill", "uphill_20_plus", "陡坡", "≥20%"),
     ("downhill", "downhill_2_5", "微下降", "-2%～-5%"),
     ("downhill", "downhill_5_10", "缓下降", "-5%～-10%"),
     ("downhill", "downhill_10_15", "中下降", "-10%～-15%"),
-    ("downhill", "downhill_15_plus", "陡下降", "≤-15%"),
+    ("downhill", "downhill_15_20", "较陡下降", "-15%～-20%"),
+    ("downhill", "downhill_20_plus", "陡下降", "≤-20%"),
 )
 HEART_RATE_INTENSITIES = (
     ("easy", "轻松"),
@@ -167,7 +170,11 @@ def calculate_prediction(
             gpx_quality = diagnose_gpx(points)
             segments = build_race_segments(points, sample_distance)
         completed += 1
-        progress.progress(completed / total_steps, text=f"已识别 {len(segments)} 个自然地形段")
+        micro_count = sum(len(list(segment.get("micro_segments", []))) for segment in segments)
+        progress.progress(
+            completed / total_steps,
+            text=f"已识别 {len(segments)} 个自然地形段、{micro_count} 个计时微分段",
+        )
 
         status.write("匹配个人能力并计算逐段时间……")
         prediction = predict_race(profile, segments, aid_minutes, condition=condition,
@@ -280,47 +287,30 @@ def render_activity_review(rows: list[dict[str, Any]], editor_key: str) -> list[
     return normalized
 
 
-def elevation_figure(segments: list[dict[str, Any]]) -> plt.Figure:
-    distances = [0.0]
-    elevations = [0.0]
-    for segment in segments:
-        distances.append(float(segment["end_km"]))
-        elevations.append(elevations[-1] + float(segment["gain"]) - float(segment["loss"]))
-    figure, axis = plt.subplots(figsize=(12, 3.6))
-    figure.patch.set_facecolor("white")
-    axis.set_facecolor("white")
-    axis.plot(distances, elevations, color="#f56b0a", linewidth=2.35)
-    axis.fill_between(distances, elevations, min(elevations), color="#f56b0a", alpha=.10)
-    axis.set_xlabel("距离（km）", color="#667085")
-    axis.set_ylabel("相对海拔（m）", color="#667085")
-    axis.grid(axis="y", color="#e8ebef", linewidth=.8)
-    axis.spines[["top", "right", "left"]].set_visible(False)
-    axis.spines["bottom"].set_color("#dfe4ea")
-    axis.tick_params(colors="#667085", labelsize=9)
-    figure.tight_layout()
-    return figure
-
-
 def ability_table(profile: dict[str, Any], direction: str) -> pd.DataFrame:
     if direction == "uphill":
         labels = (("微坡", ">2%～5%", "1_percent"), ("缓坡", "5%～10%", "5_percent"),
-                  ("中坡", "10%～15%", "10_percent"), ("陡坡", "≥15%", "15_percent"))
+                  ("中坡", "10%～15%", "10_percent"), ("较陡坡", "15%～20%", "15_percent"),
+                  ("陡坡", "≥20%", "20_percent"))
         ability = profile["uphill"]
         rows = []
+        curve = list(ability.get("curve", []))
         for index, (name, grade, key) in enumerate(labels):
             sample = ability.get("_samples", {}).get(key, {})
-            point = ability.get("curve", [{}] * 4)[index]
+            point = curve[index] if index < len(curve) else {}
             pace = _sample_pace(sample)
             rows.append([name, grade, pace, f"{float(ability[key]):.0f} m/h", f"{float(point.get('confidence', .2)):.0%}", int(sample.get("segments", 0)),
                          f"{float(sample.get('distance_km', 0)):.2f} km", f"+{float(sample.get('vertical_m', 0)):.0f} m"])
     else:
         labels = (("微下降", "-2%～-5%", "-1_percent"), ("缓下降", "-5%～-10%", "-5_percent"),
-                  ("中下降", "-10%～-15%", "-10_percent"), ("陡下降", "≤-15%", "-15_percent"))
+                  ("中下降", "-10%～-15%", "-10_percent"), ("较陡下降", "-15%～-20%", "-15_percent"),
+                  ("陡下降", "≤-20%", "-20_percent"))
         ability = profile["downhill"]
         rows = []
+        curve = list(ability.get("curve", []))
         for index, (name, grade, key) in enumerate(labels):
             sample = ability.get("_samples", {}).get(key, {})
-            point = ability.get("curve", [{}] * 4)[index]
+            point = curve[index] if index < len(curve) else {}
             pace = _sample_pace(sample, float(ability[key]["speed_mps"]))
             rows.append([name, grade, pace, f"-{float(ability[key]['vertical_speed_mph']):.0f} m/h", f"{float(point.get('confidence', .2)):.0%}",
                          int(sample.get("segments", 0)), f"{float(sample.get('distance_km', 0)):.2f} km",
@@ -842,7 +832,7 @@ with st.sidebar:
     step_heading(3, "分析参数")
     sample_distance = st.number_input(
         "坡度采样窗口（米）", min_value=50, max_value=500, value=100, step=50,
-        help="窗口越小越敏感；默认100米适合大多数越野路线。",
+        help="只控制自然坡识别灵敏度；计时和累计爬升会自动使用约25米或更细的微分段。默认100米适合大多数越野路线。",
     )
     aid_minutes = st.number_input(
         "预计补给与停留（分钟）", min_value=0, max_value=600, value=0, step=5,
@@ -860,9 +850,26 @@ with st.sidebar:
     )
     temperature = st.number_input("温度（℃）", min_value=-20, max_value=60, value=20, step=1)
     humidity = st.number_input("湿度（%）", min_value=0, max_value=100, value=60, step=5)
-    technical_level = st.select_slider("技术难度", options=[0, 1, 2, 3, 4], value=0,
-                                       format_func=lambda value: ["接近平时训练", "略难", "更难", "明显更难", "极高技术"][value])
-    mud_level = st.select_slider("相对平时的额外泥泞", options=[0, 1, 2, 3, 4], value=0)
+    technical_labels = {
+        -4: "极低技术", -3: "明显更简单", -2: "更简单", -1: "略简单",
+        0: "接近平时训练", 1: "略难", 2: "更难", 3: "明显更难", 4: "极高技术",
+    }
+    technical_level = st.select_slider(
+        "相对平时的技术难度",
+        options=list(range(-4, 5)),
+        value=0,
+        format_func=lambda value: technical_labels[value],
+    )
+    mud_labels = {
+        -4: "非常干燥", -3: "明显更干燥", -2: "更干燥", -1: "略干燥",
+        0: "接近平时训练", 1: "略泥泞", 2: "更泥泞", 3: "明显泥泞", 4: "极度泥泞",
+    }
+    mud_level = st.select_slider(
+        "相对平时的泥泞程度",
+        options=list(range(-4, 5)),
+        value=0,
+        format_func=lambda value: mud_labels[value],
+    )
     carried_weight = st.number_input("比平时额外携带重量（kg）", min_value=0.0, max_value=20.0, value=0.0, step=0.5)
     st.markdown("**自动夜间与海拔分析**")
     race_date = st.date_input("比赛日期", value=date.today())

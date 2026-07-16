@@ -108,13 +108,15 @@ class RunnerProfile:
             fatigue = data["fatigue"]
             uphill_points = uphill.get("curve") or [
                 {"grade": grade, "value": float(uphill[key]), "confidence": 0.2, "source": "legacy"}
-                for grade, key in zip((3.0, 7.5, 12.5, 18.0), ("1_percent", "5_percent", "10_percent", "15_percent"))
+                for grade, key in zip((3.0, 7.5, 12.5, 17.5, 22.5), ("1_percent", "5_percent", "10_percent", "15_percent", "20_percent"))
+                if key in uphill
             ]
             downhill_points = downhill.get("curve") or [
                 {"grade": grade, "speed_mps": float(downhill[key]["speed_mps"]),
                  "vertical_speed_mph": float(downhill[key].get("vertical_speed_mph", 0.0)),
                  "confidence": 0.2, "source": "legacy"}
-                for grade, key in zip((-3.0, -7.5, -12.5, -18.0), ("-1_percent", "-5_percent", "-10_percent", "-15_percent"))
+                for grade, key in zip((-3.0, -7.5, -12.5, -17.5, -22.5), ("-1_percent", "-5_percent", "-10_percent", "-15_percent", "-20_percent"))
+                if key in downhill
             ]
             legacy_fatigue = [
                 {"hour": 0.0, "factor": 1.0, "sample_count": 0, "source": "anchor", "confidence": None},

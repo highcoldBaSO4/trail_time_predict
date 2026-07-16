@@ -9,11 +9,13 @@ HEART_RATE_GRADE_BANDS = (
     ("uphill", "uphill_2_5", "微坡", ">2%～5%"),
     ("uphill", "uphill_5_10", "缓坡", "5%～10%"),
     ("uphill", "uphill_10_15", "中坡", "10%～15%"),
-    ("uphill", "uphill_15_plus", "陡坡", "≥15%"),
+    ("uphill", "uphill_15_20", "较陡坡", "15%～20%"),
+    ("uphill", "uphill_20_plus", "陡坡", "≥20%"),
     ("downhill", "downhill_2_5", "微下降", "-2%～-5%"),
     ("downhill", "downhill_5_10", "缓下降", "-5%～-10%"),
     ("downhill", "downhill_10_15", "中下降", "-10%～-15%"),
-    ("downhill", "downhill_15_plus", "陡下降", "≤-15%"),
+    ("downhill", "downhill_15_20", "较陡下降", "-15%～-20%"),
+    ("downhill", "downhill_20_plus", "陡下降", "≤-20%"),
 )
 HEART_RATE_INTENSITIES = (("easy", "轻松"), ("aerobic", "有氧"), ("steady", "稳态"),
                           ("threshold", "阈值"), ("high", "高强度"))
@@ -45,11 +47,12 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         ("微坡", ">2%–5%", "1_percent"),
         ("缓坡", "5%–10%", "5_percent"),
         ("中坡", "10%–15%", "10_percent"),
-        ("陡坡", "≥15%", "15_percent"),
+        ("较陡坡", "15%～20%", "15_percent"),
+        ("陡坡", "≥20%", "20_percent"),
     )
     for name, grade_range, key in uphill_rows:
         sample = uphill.get("_samples", {}).get(key, {})
-        curve_point = next((point for point in uphill.get("curve", []) if point.get("grade") == {"1_percent": 3.0, "5_percent": 7.5, "10_percent": 12.5, "15_percent": 18.0}[key]), {})
+        curve_point = next((point for point in uphill.get("curve", []) if point.get("grade") == {"1_percent": 3.0, "5_percent": 7.5, "10_percent": 12.5, "15_percent": 17.5, "20_percent": 22.5}[key]), {})
         lines.append(
             f"| {name} | {grade_range} | {_sample_pace(sample)} | {float(uphill[key]):.0f} m/h | "
             f"{float(curve_point.get('confidence', 0.2)):.0%} | "
@@ -69,12 +72,13 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         ("微下降", "-2%～-5%", "-1_percent"),
         ("缓下降", "-5%～-10%", "-5_percent"),
         ("中下降", "-10%～-15%", "-10_percent"),
-        ("陡下降", "≤-15%", "-15_percent"),
+        ("较陡下降", "-15%～-20%", "-15_percent"),
+        ("陡下降", "≤-20%", "-20_percent"),
     )
     for name, grade_range, key in downhill_rows:
         ability = downhill[key]
         sample = downhill.get("_samples", {}).get(key, {})
-        curve_point = next((point for point in downhill.get("curve", []) if point.get("grade") == {"-1_percent": -3.0, "-5_percent": -7.5, "-10_percent": -12.5, "-15_percent": -18.0}[key]), {})
+        curve_point = next((point for point in downhill.get("curve", []) if point.get("grade") == {"-1_percent": -3.0, "-5_percent": -7.5, "-10_percent": -12.5, "-15_percent": -17.5, "-20_percent": -22.5}[key]), {})
         speed = float(ability["speed_mps"])
         lines.append(
             f"| {name} | {grade_range} | {_sample_pace(sample, speed) } | "

@@ -16,8 +16,12 @@ def condition_factors(
     condition = condition.normalized()
     config = load_config()["conditions"]
     form_entry = config["current_form"].get(condition.current_form, config["current_form"]["normal"])
-    technical = float(config["technical_factors"][condition.terrain_technical_level][terrain])
-    mud = 1.0 + condition.mud_level * float(config["mud_per_level"][terrain])
+    technical_level = condition.terrain_technical_level
+    technical_base = float(config["technical_factors"][abs(technical_level)][terrain])
+    technical = technical_base if technical_level >= 0 else 1.0 / technical_base
+    mud_level = condition.mud_level
+    mud_base = 1.0 + abs(mud_level) * float(config["mud_per_level"][terrain])
+    mud = mud_base if mud_level >= 0 else 1.0 / mud_base
     target_night = condition.night_running_ratio if target_night_ratio is None else max(0.0, min(1.0, target_night_ratio))
     historical_night = max(0.0, min(1.0, historical_night_ratio))
     night_penalty = float(config["night_max"][terrain])

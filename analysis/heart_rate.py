@@ -509,7 +509,10 @@ def _grade_band(terrain: str, grade: float) -> str:
     if terrain == "flat":
         return "flat"
     magnitude = abs(float(grade))
-    label = "2_5" if magnitude < 5 else "5_10" if magnitude < 10 else "10_15" if magnitude < 15 else "15_plus"
+    label = (
+        "2_5" if magnitude < 5 else "5_10" if magnitude < 10 else
+        "10_15" if magnitude < 15 else "15_20" if magnitude < 20 else "20_plus"
+    )
     return f"{terrain}_{label}"
 
 

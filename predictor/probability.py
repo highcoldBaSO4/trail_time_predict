@@ -326,7 +326,33 @@ def _sample_gpx_geometry(
     correlation: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Perturb vertical metres, then recalculate grade and terrain base time."""
-    original_seconds = float(row["base_time_seconds"])
+    micro_segments = list(row.get("micro_segments", []))
+    if micro_segments:
+        sampled_seconds = np.zeros(count, dtype=float)
+        weighted_grade = np.zeros(count, dtype=float)
+        total_distance = 0.0
+        for micro in micro_segments:
+            unit_seconds, unit_grade = _sample_gpx_geometry_unit(
+                profile, micro, count, rng, shared, sigma, correlation
+            )
+            distance = max(float(micro.get("distance", 0.0)), 0.0)
+            sampled_seconds += unit_seconds
+            weighted_grade += unit_grade * distance
+            total_distance += distance
+        return sampled_seconds, weighted_grade / max(total_distance, 0.1)
+    return _sample_gpx_geometry_unit(profile, row, count, rng, shared, sigma, correlation)
+
+
+def _sample_gpx_geometry_unit(
+    profile: dict[str, object],
+    row: dict[str, object],
+    count: int,
+    rng: np.random.Generator,
+    shared: np.ndarray,
+    sigma: float,
+    correlation: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    original_seconds = _geometry_seconds(profile, row)
     original_grade = float(row.get("grade", 0.0))
     terrain = str(row.get("type", "flat"))
     if terrain == "flat" or not bool(row.get("elevation_available", True)):
@@ -360,6 +386,34 @@ def _sample_gpx_geometry(
     order = np.argsort(grades)
     speed = np.interp(sampled_grade, grades[order], speeds[order])
     return distance / np.maximum(speed, 0.1), sampled_grade
+
+
+def _geometry_seconds(profile: dict[str, object], row: dict[str, object]) -> float:
+    if row.get("base_time_seconds") is not None:
+        return float(row["base_time_seconds"])
+    distance = max(float(row.get("distance", 0.0)), 0.1)
+    grade = float(row.get("grade", 0.0))
+    terrain = str(row.get("type", "flat"))
+    flat_seconds = distance / 1000.0 * float(profile["flat"]["aerobic_pace"])
+    if terrain == "flat":
+        return flat_seconds
+    if terrain == "uphill":
+        curve = list(profile.get("uphill", {}).get("curve", []))
+        if not curve:
+            return flat_seconds
+        grades = np.asarray([float(point["grade"]) for point in curve])
+        values = np.asarray([float(point["value"]) for point in curve])
+        vam = float(np.interp(grade, grades, values))
+        vertical = max(float(row.get("gain", 0.0)), distance * max(grade, 0.0) / 100.0)
+        return max(vertical / max(vam, 1.0) * 3600.0, flat_seconds)
+    curve = list(profile.get("downhill", {}).get("curve", []))
+    if not curve:
+        return flat_seconds
+    grades = np.asarray([float(point["grade"]) for point in curve])
+    speeds = np.asarray([float(point["speed_mps"]) for point in curve])
+    order = np.argsort(grades)
+    speed = float(np.interp(grade, grades[order], speeds[order]))
+    return distance / max(speed, 0.1)
 
 
 def _interpolate_fatigue_samples(

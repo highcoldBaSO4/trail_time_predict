@@ -231,7 +231,17 @@ def save_prediction(prediction: dict[str, object], path: str | Path) -> None:
     target.write_text(json.dumps(prediction, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def _base_segment_seconds(profile: dict[str, object], segment: dict[str, float | str]) -> tuple[float, str]:
+def _base_segment_seconds(profile: dict[str, object], segment: dict[str, object]) -> tuple[float, str]:
+    micro_segments = list(segment.get("micro_segments", []))
+    if micro_segments:
+        results = [_base_terrain_unit_seconds(profile, micro) for micro in micro_segments]
+        seconds = sum(result[0] for result in results)
+        grades = [float(micro.get("grade", 0.0)) for micro in micro_segments]
+        return seconds, f"{len(micro_segments)} 个微分段 / 局部坡度 {min(grades):.1f}%～{max(grades):.1f}%"
+    return _base_terrain_unit_seconds(profile, segment)
+
+
+def _base_terrain_unit_seconds(profile: dict[str, object], segment: dict[str, object]) -> tuple[float, str]:
     grade = float(segment["grade"])
     distance = float(segment["distance"])
     segment_type = str(segment.get("type", "flat"))
@@ -240,7 +250,7 @@ def _base_segment_seconds(profile: dict[str, object], segment: dict[str, float |
         if curve:
             vam = interpolate_uphill_vam(grade, [(float(point["grade"]), float(point["value"])) for point in curve])
         else:
-            label = "15_percent" if grade >= 15 else "10_percent" if grade >= 10 else "5_percent" if grade >= 5 else "1_percent"
+            label = "20_percent" if grade >= 20 else "15_percent" if grade >= 15 else "10_percent" if grade >= 10 else "5_percent" if grade >= 5 else "1_percent"
             vam = float(profile["uphill"][label])
         gain = max(float(segment["gain"]), distance * grade / 100.0)
         climbing_seconds = gain / max(vam, 1.0) * 3600.0
@@ -251,7 +261,7 @@ def _base_segment_seconds(profile: dict[str, object], segment: dict[str, float |
         if curve:
             speed = interpolate_downhill_speed(grade, [(float(point["grade"]), float(point["speed_mps"])) for point in curve])
         else:
-            label = "-15_percent" if grade <= -15 else "-10_percent" if grade <= -10 else "-5_percent" if grade <= -5 else "-1_percent"
+            label = "-20_percent" if grade <= -20 else "-15_percent" if grade <= -15 else "-10_percent" if grade <= -10 else "-5_percent" if grade <= -5 else "-1_percent"
             speed = float(profile["downhill"][label]["speed_mps"])
         return distance / max(speed, 0.1), f"{grade:.1f}%坡 / 下坡速度 {speed:.2f} m/s"
     pace = float(profile["flat"]["aerobic_pace"])

@@ -18,7 +18,8 @@ def build_downhill_profile(intervals: pd.DataFrame) -> dict[str, dict[str, float
     bins = (
         ((grade > -10.0) & (grade < -5.0), "-5_percent"),
         ((grade > -15.0) & (grade <= -10.0), "-10_percent"),
-        ((grade <= -15.0), "-15_percent"),
+        ((grade > -20.0) & (grade <= -15.0), "-15_percent"),
+        ((grade <= -20.0), "-20_percent"),
     )
     for grade_mask, label in bins:
         sample = intervals[

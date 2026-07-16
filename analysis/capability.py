@@ -25,8 +25,8 @@ from parser.gpx_reader import group_terrain_chunks
 _CONFIG_DEFAULTS = load_config()["default_profile"]
 DEFAULT_PROFILE = {
     "flat": _CONFIG_DEFAULTS["flat"],
-    "uphill": dict(zip(("1_percent", "5_percent", "10_percent", "15_percent"), (p["value"] for p in _CONFIG_DEFAULTS["uphill"]))),
-    "downhill": dict(zip(("-1_percent", "-5_percent", "-10_percent", "-15_percent"),
+    "uphill": dict(zip(("1_percent", "5_percent", "10_percent", "15_percent", "20_percent"), (p["value"] for p in _CONFIG_DEFAULTS["uphill"]))),
+    "downhill": dict(zip(("-1_percent", "-5_percent", "-10_percent", "-15_percent", "-20_percent"),
                             ({"speed_mps": p["speed_mps"], "vertical_speed_mph": p["vertical_speed_mph"]} for p in _CONFIG_DEFAULTS["downhill"]))),
 }
 
@@ -275,7 +275,8 @@ def _build_uphill_profile(segments: pd.DataFrame) -> dict[str, object]:
         (flat_limit, 5.0, "1_percent"),
         (5.0, 10.0, "5_percent"),
         (10.0, 15.0, "10_percent"),
-        (15.0, 100.0, "15_percent"),
+        (15.0, 20.0, "15_percent"),
+        (20.0, 100.0, "20_percent"),
     ):
         sample = segments[
             (segments["type"] == "uphill")
@@ -301,7 +302,8 @@ def _build_downhill_profile(segments: pd.DataFrame) -> dict[str, object]:
         ((grade > -5.0) & (grade < -flat_limit), "-1_percent"),
         ((grade > -10.0) & (grade <= -5.0), "-5_percent"),
         ((grade > -15.0) & (grade <= -10.0), "-10_percent"),
-        ((grade <= -15.0), "-15_percent"),
+        ((grade > -20.0) & (grade <= -15.0), "-15_percent"),
+        ((grade <= -20.0), "-20_percent"),
     )
     samples: dict[str, dict[str, float | int]] = {}
     for grade_mask, label in bins:
@@ -374,7 +376,7 @@ def _slope_sample_summary(segments: pd.DataFrame, vertical_column: str) -> dict[
 
 def _uphill_curve(profile: dict[str, object], quality_score: float) -> list[dict[str, object]]:
     result = []
-    for grade, key in zip((3.0, 7.5, 12.5, 18.0), ("1_percent", "5_percent", "10_percent", "15_percent")):
+    for grade, key in zip((3.0, 7.5, 12.5, 17.5, 22.5), ("1_percent", "5_percent", "10_percent", "15_percent", "20_percent")):
         sample = profile.get("_samples", {}).get(key, {})
         seconds = float(sample.get("duration_hour", 0)) * 3600.0
         count = int(sample.get("segments", 0))
@@ -389,7 +391,7 @@ def _uphill_curve(profile: dict[str, object], quality_score: float) -> list[dict
 
 def _downhill_curve(profile: dict[str, object], quality_score: float) -> list[dict[str, object]]:
     result = []
-    for grade, key in zip((-3.0, -7.5, -12.5, -18.0), ("-1_percent", "-5_percent", "-10_percent", "-15_percent")):
+    for grade, key in zip((-3.0, -7.5, -12.5, -17.5, -22.5), ("-1_percent", "-5_percent", "-10_percent", "-15_percent", "-20_percent")):
         sample = profile.get("_samples", {}).get(key, {})
         seconds = float(sample.get("duration_hour", 0)) * 3600.0
         count = int(sample.get("segments", 0))
@@ -467,7 +469,7 @@ def _duration_factors(
     global_flat: dict[str, object], global_uphill: dict[str, object], global_downhill: dict[str, object],
 ) -> dict[str, float]:
     flat_factor = float(flat.get("aerobic_pace", global_flat["aerobic_pace"])) / float(global_flat["aerobic_pace"])
-    up_ratios = [float(global_uphill[key]) / max(float(uphill[key]), 1.0) for key in ("1_percent", "5_percent", "10_percent", "15_percent")]
-    down_ratios = [float(global_downhill[key]["speed_mps"]) / max(float(downhill[key]["speed_mps"]), 0.1) for key in ("-1_percent", "-5_percent", "-10_percent", "-15_percent")]
+    up_ratios = [float(global_uphill[key]) / max(float(uphill[key]), 1.0) for key in ("1_percent", "5_percent", "10_percent", "15_percent", "20_percent")]
+    down_ratios = [float(global_downhill[key]["speed_mps"]) / max(float(downhill[key]["speed_mps"]), 0.1) for key in ("-1_percent", "-5_percent", "-10_percent", "-15_percent", "-20_percent")]
     return {"flat": round(float(np.median(flat_factor)), 3), "uphill": round(float(np.median(up_ratios)), 3),
             "downhill": round(float(np.median(down_ratios)), 3)}
