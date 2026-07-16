@@ -60,7 +60,7 @@ st.set_page_config(
     page_title="越野跑比赛时间预测",
     page_icon="⛰️",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 
@@ -131,9 +131,40 @@ def inject_styles() -> None:
         [data-testid="stDataFrame"] { border: 1px solid var(--trail-border); border-radius: 8px; overflow: hidden; }
         div[data-testid="stExpander"] { background: #fff; border-color: var(--trail-border); }
         @media (max-width: 900px) {
-            .block-container { padding-top: 1rem; }
+            .block-container {
+                padding: .75rem .75rem 2rem !important;
+                max-width: 100%;
+            }
+            [data-testid="stSidebar"] {
+                width: min(88vw, 22rem) !important;
+                min-width: min(88vw, 22rem) !important;
+            }
+            [data-testid="stHorizontalBlock"] {
+                flex-direction: column !important;
+                gap: .65rem !important;
+            }
+            [data-testid="stHorizontalBlock"] > [data-testid="stColumn"] {
+                width: 100% !important;
+                flex: 1 1 100% !important;
+                min-width: 0 !important;
+            }
+            [data-testid="stMetric"] { padding: .65rem .8rem; }
+            [data-testid="stDataFrame"], [data-testid="stDataEditor"] {
+                max-width: calc(100vw - 1.5rem);
+                overflow-x: auto;
+            }
+            [data-baseweb="tab-list"] {
+                overflow-x: auto;
+                scrollbar-width: thin;
+                gap: 1rem;
+            }
+            [data-baseweb="tab"] { flex: 0 0 auto; white-space: nowrap; }
+            .stButton > button, .stDownloadButton > button { width: 100%; }
+            h1 { font-size: 1.55rem !important; }
+            h2 { font-size: 1.15rem !important; }
             .result-time { font-size: 2.1rem; }
             [data-testid="stMetricValue"] { font-size: 1.15rem; }
+            .empty-state { min-height: 280px; padding: 1.5rem 1rem; }
         }
         </style>
         """,

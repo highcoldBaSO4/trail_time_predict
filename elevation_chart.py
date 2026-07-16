@@ -48,7 +48,7 @@ SLOPE_STYLES = {
 def elevation_figure(
     segments: list[dict[str, Any]],
     *,
-    figsize: tuple[float, float] = (12, 4.2),
+    figsize: tuple[float, float] = (11, 5.2),
 ) -> plt.Figure:
     detailed = [
         micro
@@ -104,10 +104,10 @@ def elevation_figure(
     axis.legend(
         handles=legend,
         loc="upper center",
-        bbox_to_anchor=(0.5, 1.19),
-        ncol=6,
+        bbox_to_anchor=(0.5, 1.24),
+        ncol=3,
         frameon=False,
-        fontsize=8.5,
+        fontsize=8.2,
         handlelength=2.0,
         columnspacing=1.3,
     )
