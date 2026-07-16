@@ -44,6 +44,9 @@ quality:
   max_timestamp_gap_seconds: 120.0
   gpx_resample_distances_m: [50.0, 100.0, 200.0]
 
+terrain:
+  flat_grade_abs_percent: 2.0
+
 duration_capability:
   layers:
     - {name: short, label: 短时, min_hours: 0.0, max_hours: 2.0, center_hours: 1.0, fallback_time_factor: 0.96}

@@ -18,9 +18,8 @@ from analysis.downhill import interpolate_downhill_speed
 from analysis.fatigue import interpolate_fatigue
 from analysis.uphill import interpolate_uphill_vam
 from config import load_config
-from models import CapabilityValue
-from models import RaceCondition
-from parser.gpx_reader import build_race_segments, read_gpx, route_summary
+from models import CapabilityValue, PredictionResult, RaceCondition, RunnerProfile
+from parser.gpx_reader import _terrain_type, build_race_segments, read_gpx, route_summary
 from parser import fit_reader
 from predictor.race_predictor import format_duration, predict_race
 from predictor.report import build_markdown_report
@@ -129,7 +128,7 @@ def test_gpx_segmentation_prediction_and_report() -> None:
 
 def test_segmentation_groups_a_continuous_slope_as_one_natural_climb() -> None:
     points = [
-        {"latitude": 0.0, "longitude": index * (500.0 / 111_194.9266), "elevation": float(index * 10)}
+        {"latitude": 0.0, "longitude": index * (500.0 / 111_194.9266), "elevation": float(index * 30)}
         for index in range(5)
     ]
     segments = build_race_segments(points, 500.0)
@@ -182,8 +181,17 @@ def test_fit_reader_keeps_records_before_trailing_parse_error(monkeypatch, tmp_p
 
 def test_config_and_typed_capability_model() -> None:
     assert load_config()["confidence"]["default"] == 0.20
+    assert load_config()["terrain"]["flat_grade_abs_percent"] == 2.0
     value = CapabilityValue(420, "seconds_per_km", "personal", 0.8, sample_count=4)
     assert value.sample_count == 4
+
+
+def test_flat_grade_threshold_is_consistent() -> None:
+    assert _terrain_type(-2.0) == "flat"
+    assert _terrain_type(0.0) == "flat"
+    assert _terrain_type(2.0) == "flat"
+    assert _terrain_type(-2.01) == "downhill"
+    assert _terrain_type(2.01) == "uphill"
 
 
 def test_continuous_capability_and_fatigue_interpolation() -> None:
@@ -211,7 +219,7 @@ def test_gpx_quality_reports_multiscale_gain() -> None:
 
 def test_profile_exposes_quality_confidence_and_continuous_curves() -> None:
     profile = build_runner_profile({"training.fit": synthetic_activity()})
-    assert profile["schema_version"] == "0.2-phase1"
+    assert profile["schema_version"] == "0.2"
     assert 0 <= profile["flat"]["confidence"] <= 1
     assert len(profile["uphill"]["curve"]) == 4
     assert len(profile["downhill"]["curve"]) == 4
@@ -219,6 +227,33 @@ def test_profile_exposes_quality_confidence_and_continuous_curves() -> None:
     for terrain in ("flat", "uphill", "downhill"):
         anchor = profile["fatigue"][terrain][0]
         assert anchor == {"hour": 0.0, "factor": 1.0, "sample_count": 0, "source": "anchor", "confidence": None}
+
+
+def test_runner_profile_typed_round_trip_and_missing_fields() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    typed = RunnerProfile.from_profile_dict(profile)
+    restored = typed.to_profile_dict()
+
+    assert typed.source_activity_count == 1
+    assert restored["flat"]["aerobic_pace"] == profile["flat"]["aerobic_pace"]
+    assert restored["uphill"]["curve"] == profile["uphill"]["curve"]
+    with pytest.raises(ValueError, match="个人能力画像结构无效"):
+        RunnerProfile.from_profile_dict({})
+
+
+def test_runner_profile_typed_model_upgrades_legacy_curves() -> None:
+    legacy = build_runner_profile({"training.fit": synthetic_activity()})
+    legacy["uphill"].pop("curve")
+    legacy["downhill"].pop("curve")
+    for terrain in ("flat", "uphill", "downhill"):
+        legacy["fatigue"].pop(terrain)
+
+    upgraded = RunnerProfile.from_profile_dict(legacy).to_profile_dict()
+
+    assert len(upgraded["uphill"]["curve"]) == 4
+    assert len(upgraded["downhill"]["curve"]) == 4
+    assert upgraded["fatigue"]["flat"][2]["factor"] == legacy["fatigue"]["5h"]
+    assert upgraded["uphill"]["curve"][0]["source"] == "legacy"
 
 
 def test_profile_exposes_duration_capability_layers() -> None:
@@ -257,6 +292,20 @@ def test_phase2_monte_carlo_is_reproducible() -> None:
     first = predict_race(profile, segments, simulations=1000, seed=99)
     second = predict_race(profile, segments, simulations=1000, seed=99)
     assert first["probability"] == second["probability"]
+
+
+def test_prediction_result_typed_round_trip_and_order_validation() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    segments = [{"distance": 1000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
+                 "type": "flat", "start_km": 0.0, "end_km": 1.0}]
+    prediction = predict_race(profile, segments, simulations=1000, seed=11)
+    typed = PredictionResult.from_dict(prediction)
+
+    assert typed.to_dict()["probability"] == prediction["probability"]
+    invalid = dict(prediction)
+    invalid["optimistic_time_seconds"] = invalid["conservative_time_seconds"] + 1
+    with pytest.raises(ValueError, match="P10 <= P50 <= P90"):
+        PredictionResult.from_dict(invalid)
 
 
 def test_negative_time_impact_formats_with_a_single_sign() -> None:

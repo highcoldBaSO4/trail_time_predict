@@ -204,7 +204,7 @@ def probability_figure(samples: list[float], p10: float, p50: float, p90: float)
 
 def ability_table(profile: dict[str, Any], direction: str) -> pd.DataFrame:
     if direction == "uphill":
-        labels = (("微坡", "1%～5%", "1_percent"), ("缓坡", "5%～10%", "5_percent"),
+        labels = (("微坡", ">2%～5%", "1_percent"), ("缓坡", "5%～10%", "5_percent"),
                   ("中坡", "10%～15%", "10_percent"), ("陡坡", "≥15%", "15_percent"))
         ability = profile["uphill"]
         rows = []
@@ -215,7 +215,7 @@ def ability_table(profile: dict[str, Any], direction: str) -> pd.DataFrame:
             rows.append([name, grade, pace, f"{float(ability[key]):.0f} m/h", f"{float(point.get('confidence', .2)):.0%}", int(sample.get("segments", 0)),
                          f"{float(sample.get('distance_km', 0)):.2f} km", f"+{float(sample.get('vertical_m', 0)):.0f} m"])
     else:
-        labels = (("微下降", "-1%～-5%", "-1_percent"), ("缓下降", "-5%～-10%", "-5_percent"),
+        labels = (("微下降", "-2%～-5%", "-1_percent"), ("缓下降", "-5%～-10%", "-5_percent"),
                   ("中下降", "-10%～-15%", "-10_percent"), ("陡下降", "≤-15%", "-15_percent"))
         ability = profile["downhill"]
         rows = []

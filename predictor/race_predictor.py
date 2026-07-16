@@ -7,7 +7,7 @@ from analysis.downhill import interpolate_downhill_speed
 from analysis.fatigue import interpolate_fatigue
 from analysis.uphill import interpolate_uphill_vam
 from config import load_config
-from models import RaceCondition
+from models import PredictionResult, RaceCondition, RunnerProfile
 from parser.gpx_reader import route_summary
 from predictor.condition_adjustment import condition_factors
 from predictor.duration_adjustment import duration_match
@@ -26,6 +26,7 @@ def predict_race(
     """Predict standard, condition-adjusted and probabilistic race times."""
     if not segments:
         raise ValueError("比赛路线没有分段数据")
+    profile = RunnerProfile.from_profile_dict(profile).to_profile_dict()
     race_condition = (condition or RaceCondition(aid_station_minutes=aid_minutes)).normalized()
     if condition is not None and aid_minutes > 0 and race_condition.aid_station_minutes == 0:
         race_condition = RaceCondition(**{**race_condition.to_dict(), "aid_station_minutes": aid_minutes})
@@ -50,7 +51,7 @@ def predict_race(
     probability = simulate_finish_times(adjusted_seconds, aid_seconds, confidence, gpx_quality_score, simulations, seed)
     risks = _risk_notes(profile, adjusted_rows, gpx_quality_score, converged)
 
-    return {
+    payload = {
         "schema_version": "0.2",
         "route": route_summary(segments),
         "condition": race_condition.to_dict(),
@@ -72,6 +73,7 @@ def predict_race(
         "aid_time_seconds": round(aid_seconds, 1),
         "total_time_seconds": round(adjusted_seconds + aid_seconds, 1),
     }
+    return PredictionResult.from_dict(payload).to_dict()
 
 
 def _predict_once(

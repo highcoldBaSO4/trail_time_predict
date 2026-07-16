@@ -12,6 +12,7 @@ from analysis.confidence import aggregate_quality_score, calculate_confidence
 from analysis.data_quality import diagnose_fit
 from analysis.fatigue import build_fatigue_profile
 from config import load_config
+from models import RunnerProfile
 from parser.gpx_reader import group_terrain_chunks
 
 
@@ -58,7 +59,7 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
         summary["data_quality"] = quality_reports[name]
         activity_summaries.append(summary)
     profile: dict[str, object] = {
-        "schema_version": "0.2-phase1",
+        "schema_version": "0.2",
         "units": {
             "flat_pace": "seconds_per_km",
             "uphill": "vertical_metres_per_hour",
@@ -84,7 +85,7 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
             "recommended_count": sum(bool(report["recommended_for_model"]) for report in quality_reports.values()),
         },
     }
-    return profile
+    return RunnerProfile.from_profile_dict(profile).to_profile_dict()
 
 
 def save_runner_profile(profile: dict[str, object], path: str | Path) -> None:
@@ -98,8 +99,10 @@ def _build_flat_profile(segments: pd.DataFrame, quality_score: float = 1.0) -> d
     if segments.empty:
         flat_segments = segments
     else:
+        flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
         flat_segments = segments[
             (segments["type"] == "flat")
+            & segments["grade_pct"].between(-flat_limit, flat_limit)
             & (segments["distance_m"] >= 200.0)
             & segments["pace"].between(150.0, 1800.0)
         ]
@@ -228,8 +231,9 @@ def _activity_terrain_segments(
 def _build_uphill_profile(segments: pd.DataFrame) -> dict[str, object]:
     result: dict[str, object] = {}
     samples: dict[str, dict[str, float | int]] = {}
+    flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
     for low, high, label in (
-        (1.0, 5.0, "1_percent"),
+        (flat_limit, 5.0, "1_percent"),
         (5.0, 10.0, "5_percent"),
         (10.0, 15.0, "10_percent"),
         (15.0, 100.0, "15_percent"),
@@ -253,8 +257,9 @@ def _build_downhill_profile(segments: pd.DataFrame) -> dict[str, object]:
         result["_samples"] = {}
         return result
     grade = segments["grade_pct"]
+    flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
     bins = (
-        ((grade > -5.0) & (grade < -1.0), "-1_percent"),
+        ((grade > -5.0) & (grade < -flat_limit), "-1_percent"),
         ((grade > -10.0) & (grade <= -5.0), "-5_percent"),
         ((grade > -15.0) & (grade <= -10.0), "-10_percent"),
         ((grade <= -15.0), "-15_percent"),

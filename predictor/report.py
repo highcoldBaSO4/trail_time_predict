@@ -28,7 +28,7 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     uphill_rows = (
-        ("微坡", "1%–5%", "1_percent"),
+        ("微坡", ">2%–5%", "1_percent"),
         ("缓坡", "5%–10%", "5_percent"),
         ("中坡", "10%–15%", "10_percent"),
         ("陡坡", "≥15%", "15_percent"),
@@ -52,7 +52,7 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         ]
     )
     downhill_rows = (
-        ("微下降", "-1%～-5%", "-1_percent"),
+        ("微下降", "-2%～-5%", "-1_percent"),
         ("缓下降", "-5%～-10%", "-5_percent"),
         ("中下降", "-10%～-15%", "-10_percent"),
         ("陡下降", "≤-15%", "-15_percent"),

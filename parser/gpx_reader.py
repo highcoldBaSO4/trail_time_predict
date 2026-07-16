@@ -8,6 +8,8 @@ from typing import TextIO
 import gpxpy
 import numpy as np
 
+from config import load_config
+
 
 EARTH_RADIUS_M = 6_371_000.0
 
@@ -159,7 +161,8 @@ def _terrain_chunks(
 
 
 def _terrain_type(grade: float) -> str:
-    return "uphill" if grade > 1.0 else "downhill" if grade < -1.0 else "flat"
+    flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
+    return "uphill" if grade > flat_limit else "downhill" if grade < -flat_limit else "flat"
 
 
 def group_terrain_chunks(

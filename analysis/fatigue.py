@@ -58,7 +58,14 @@ def _terrain_samples(activity: pd.DataFrame, terrain: str) -> pd.DataFrame:
     valid = activity[activity["valid_interval"].fillna(False)].copy()
     valid["elapsed_h"] = valid["dt_seconds"].fillna(0).cumsum() / 3600.0
     grade = valid["grade_pct"]
-    mask = grade.between(-2, 2) if terrain == "flat" else grade > 5 if terrain == "uphill" else grade < -5
+    flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
+    mask = (
+        grade.between(-flat_limit, flat_limit)
+        if terrain == "flat"
+        else grade > flat_limit
+        if terrain == "uphill"
+        else grade < -flat_limit
+    )
     selected = valid[mask].copy()
     selected["vam"] = selected["delev_m"].clip(lower=0) / selected["dt_seconds"] * 3600.0
     return selected
