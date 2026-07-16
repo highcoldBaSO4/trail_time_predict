@@ -4,7 +4,30 @@ from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from matplotlib.lines import Line2D
+
+
+FONT_PATH = Path(__file__).resolve().parent / "assets" / "fonts" / "NotoSansCJKsc-Regular.otf"
+CHINESE_FONT_FAMILY = "Noto Sans CJK SC"
+
+
+def configure_chart_font() -> None:
+    """Register the bundled CJK font for Linux-based cloud deployments."""
+    if FONT_PATH.is_file():
+        font_manager.fontManager.addfont(FONT_PATH)
+        plt.rcParams["font.family"] = "sans-serif"
+        plt.rcParams["font.sans-serif"] = [
+            CHINESE_FONT_FAMILY,
+            "Microsoft YaHei",
+            "SimHei",
+            "Arial Unicode MS",
+            "DejaVu Sans",
+        ]
+    plt.rcParams["axes.unicode_minus"] = False
+
+
+configure_chart_font()
 
 
 SLOPE_STYLES = {

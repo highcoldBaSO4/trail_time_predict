@@ -25,7 +25,7 @@ from predictor.race_predictor import format_duration, format_pace, predict_race
 from predictor.report import build_markdown_report
 
 
-plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
+plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
 
 logger = logging.getLogger(__name__)
