@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
+from datetime import timedelta, timezone
 from pathlib import Path
 
 from analysis.downhill import interpolate_downhill_speed
+from analysis.environment import relative_altitude_factor, solar_elevation_degrees
 from analysis.fatigue import interpolate_fatigue
 from analysis.uphill import interpolate_uphill_vam
 from config import load_config
@@ -29,7 +32,7 @@ def predict_race(
     profile = RunnerProfile.from_profile_dict(profile).to_profile_dict()
     race_condition = (condition or RaceCondition(aid_station_minutes=aid_minutes)).normalized()
     if condition is not None and aid_minutes > 0 and race_condition.aid_station_minutes == 0:
-        race_condition = RaceCondition(**{**race_condition.to_dict(), "aid_station_minutes": aid_minutes})
+        race_condition = replace(race_condition, aid_station_minutes=aid_minutes)
 
     estimate_hours = _initial_estimate_hours(profile, segments)
     duration_config = load_config()["duration_capability"]
@@ -37,7 +40,9 @@ def predict_race(
     standard_rows: list[dict[str, object]] = []
     standard_seconds = 0.0
     for iteration in range(1, int(duration_config["max_iterations"]) + 1):
-        standard_rows, standard_seconds, _ = _predict_once(profile, segments, estimate_hours, RaceCondition())
+        standard_rows, standard_seconds, _ = _predict_once(
+            profile, segments, estimate_hours, RaceCondition(), apply_environment=False
+        )
         updated_hours = standard_seconds / 3600.0
         if abs(updated_hours - estimate_hours) * 3600.0 <= float(duration_config["convergence_tolerance_seconds"]):
             converged = True
@@ -50,6 +55,7 @@ def predict_race(
     confidence = _prediction_confidence(profile, adjusted_rows)
     probability = simulate_finish_times(adjusted_seconds, aid_seconds, confidence, gpx_quality_score, simulations, seed)
     risks = _risk_notes(profile, adjusted_rows, gpx_quality_score, converged)
+    environment_summary = _environment_summary(profile, adjusted_rows)
 
     payload = {
         "schema_version": "0.2",
@@ -67,6 +73,7 @@ def predict_race(
         "adjustment_breakdown": {**breakdown, "aid_station": round(aid_seconds, 1)},
         "probability": probability,
         "risk_notes": risks,
+        "environment": environment_summary,
         "segments": adjusted_rows,
         # V0.1 compatibility fields.
         "moving_time_seconds": round(adjusted_seconds, 1),
@@ -78,7 +85,7 @@ def predict_race(
 
 def _predict_once(
     profile: dict[str, object], segments: list[dict[str, float | str]], estimated_hours: float,
-    condition: RaceCondition,
+    condition: RaceCondition, apply_environment: bool = True,
 ) -> tuple[list[dict[str, object]], float, dict[str, float]]:
     elapsed = 0.0
     rows: list[dict[str, object]] = []
@@ -92,7 +99,16 @@ def _predict_once(
         sustainable_seconds = raw_seconds * float(match["factor"])
         fatigue = fatigue_factor(profile, elapsed / 3600.0, terrain)
         standard_seconds = sustainable_seconds / max(fatigue, 0.1)
-        factors = condition_factors(condition, terrain)
+        environment = _segment_environment(
+            profile, segment, condition, elapsed, standard_seconds, apply_environment
+        )
+        factors = condition_factors(
+            condition,
+            terrain,
+            target_night_ratio=float(environment["night_ratio"]),
+            historical_night_ratio=float(environment["historical_night_ratio"]),
+            automatic_altitude_factor=float(environment["altitude_factor"]),
+        )
         adjusted = standard_seconds
         factor_increases: dict[str, float] = {}
         for name, factor in factors.items():
@@ -114,6 +130,7 @@ def _predict_once(
                      "condition_factors": {key: round(value, 4) for key, value in factors.items()},
                      "condition_factor": round(adjusted / max(standard_seconds, 0.1), 4),
                      "condition_increase_seconds": {key: round(value, 1) for key, value in factor_increases.items()},
+                     "environment": environment,
                      "predicted_time_seconds": round(adjusted, 1),
                      "cumulative_time_seconds": round(elapsed, 1), "basis": basis})
     return rows, elapsed, {key: round(value, 1) for key, value in totals.items()}
@@ -174,7 +191,14 @@ def _prediction_confidence(profile: dict[str, object], rows: list[dict[str, obje
     values.extend(float(point.get("confidence", 0.2)) for point in profile.get("downhill", {}).get("curve", []))
     values.extend(float(row.get("duration_confidence", 0.2)) for row in rows)
     values.append(float(profile.get("data_quality", {}).get("score", 0.2)))
-    return max(0.2, min(0.95, sum(values) / len(values)))
+    confidence = sum(values) / len(values)
+    altitude_profile = profile.get("environment", {}).get("altitude", {})
+    historical_p90 = float(altitude_profile.get("p90_m", 0.0))
+    route_max = max((float(row.get("environment", {}).get("elevation_m", 0.0)) for row in rows), default=0.0)
+    environment_config = load_config()["environment"]["altitude"]
+    if route_max > historical_p90 + float(environment_config["coverage_margin_m"]):
+        confidence -= float(environment_config["confidence_penalty"])
+    return max(0.2, min(0.95, confidence))
 
 
 def _risk_notes(profile: dict[str, object], rows: list[dict[str, object]], gpx_quality: float, converged: bool) -> list[str]:
@@ -187,7 +211,85 @@ def _risk_notes(profile: dict[str, object], rows: list[dict[str, object]], gpx_q
         notes.append("持续能力与预计时长迭代未完全收敛。")
     if float(profile.get("data_quality", {}).get("score", 1.0)) < 0.6:
         notes.append("历史 FIT 数据质量偏低。")
+    altitude_profile = profile.get("environment", {}).get("altitude", {})
+    historical_p90 = float(altitude_profile.get("p90_m", 0.0))
+    route_max = max((float(row.get("environment", {}).get("elevation_m", 0.0)) for row in rows), default=0.0)
+    margin = float(load_config()["environment"]["altitude"]["coverage_margin_m"])
+    if route_max > historical_p90 + margin:
+        notes.append(
+            f"比赛最高海拔约 {route_max:.0f}m，明显高于历史训练覆盖 {historical_p90:.0f}m，已降低预测可信度。"
+        )
+    if any(bool(row.get("environment", {}).get("night")) for row in rows):
+        night_source = profile.get("environment", {}).get("night", {}).get("source")
+        if night_source == "unavailable":
+            notes.append("比赛包含夜间路段，但历史 FIT 缺少可用经纬度，夜间能力使用默认折减。")
     return notes
+
+
+def _segment_environment(
+    profile: dict[str, object],
+    segment: dict[str, object],
+    condition: RaceCondition,
+    elapsed_seconds: float,
+    segment_seconds: float,
+    apply_environment: bool,
+) -> dict[str, object]:
+    history = profile.get("environment", {})
+    historical_night = float(history.get("night", {}).get("ratio", 0.0)) if apply_environment else 0.0
+    target_night = float(condition.night_running_ratio) if apply_environment else 0.0
+    solar_elevation: float | None = None
+    night = target_night >= 0.5
+    if apply_environment and condition.race_start_time_utc is not None and "latitude" in segment and "longitude" in segment:
+        start_time = condition.race_start_time_utc
+        if start_time.tzinfo is None:
+            start_time = start_time.replace(tzinfo=timezone.utc)
+        midpoint = start_time + timedelta(seconds=elapsed_seconds + segment_seconds / 2.0)
+        solar_elevation = solar_elevation_degrees(midpoint, float(segment["latitude"]), float(segment["longitude"]))
+        threshold = float(load_config()["environment"]["night_solar_elevation_degrees"])
+        night = solar_elevation <= threshold
+        target_night = 1.0 if night else 0.0
+    elevation_available = bool(segment.get("elevation_available", False))
+    elevation = float(segment.get("elevation", 0.0)) if elevation_available else 0.0
+    historical_elevation = float(history.get("altitude", {}).get("mean_m", 0.0))
+    altitude_factor = (
+        relative_altitude_factor(elevation, historical_elevation)
+        if apply_environment and elevation_available
+        else float(condition.altitude_factor) if apply_environment else 1.0
+    )
+    return {
+        "night": night,
+        "night_ratio": round(target_night, 3),
+        "historical_night_ratio": round(historical_night, 3),
+        "solar_elevation_degrees": None if solar_elevation is None else round(solar_elevation, 1),
+        "elevation_m": round(elevation, 1),
+        "elevation_available": elevation_available,
+        "historical_elevation_m": round(historical_elevation, 1),
+        "altitude_factor": round(altitude_factor, 4),
+    }
+
+
+def _environment_summary(profile: dict[str, object], rows: list[dict[str, object]]) -> dict[str, object]:
+    total_seconds = sum(float(row["predicted_time_seconds"]) for row in rows)
+    night_seconds = sum(
+        float(row["predicted_time_seconds"]) * float(row.get("environment", {}).get("night_ratio", 0.0))
+        for row in rows
+    )
+    altitude_rows = [row for row in rows if bool(row.get("environment", {}).get("elevation_available", False))]
+    distance = sum(float(row["distance"]) for row in altitude_rows)
+    average_elevation = (
+        sum(float(row["environment"]["elevation_m"]) * float(row["distance"]) for row in altitude_rows) / distance
+        if distance > 0 else None
+    )
+    maximum_elevation = max((float(row["environment"]["elevation_m"]) for row in altitude_rows), default=None)
+    return {
+        "historical_night_ratio": float(profile.get("environment", {}).get("night", {}).get("ratio", 0.0)),
+        "race_night_ratio": round(night_seconds / total_seconds, 4) if total_seconds > 0 else 0.0,
+        "race_night_seconds": round(night_seconds, 1),
+        "historical_mean_elevation_m": float(profile.get("environment", {}).get("altitude", {}).get("mean_m", 0.0)),
+        "historical_p90_elevation_m": float(profile.get("environment", {}).get("altitude", {}).get("p90_m", 0.0)),
+        "race_average_elevation_m": None if average_elevation is None else round(average_elevation, 1),
+        "race_maximum_elevation_m": None if maximum_elevation is None else round(maximum_elevation, 1),
+    }
 
 
 def format_duration(seconds: float) -> str:

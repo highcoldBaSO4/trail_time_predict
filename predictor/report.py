@@ -89,6 +89,21 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
     quality = profile.get("data_quality", {})
     lines.extend(["", "### 数据质量", "", f"- 综合评分：{float(quality.get('score', 0.2)):.0%}",
                   f"- 建议用于建模：{int(quality.get('recommended_count', 0))}/{int(profile.get('sample_count', 0))} 个活动"])
+    historical_environment = profile.get("environment", {})
+    historical_night = historical_environment.get("night", {})
+    historical_altitude = historical_environment.get("altitude", {})
+    lines.extend(
+        [
+            "",
+            "### 历史环境覆盖",
+            "",
+            f"- 历史夜间运动占比：{float(historical_night.get('ratio', 0)):.1%}",
+            f"- 历史训练平均海拔：{float(historical_altitude.get('mean_m', 0)):.0f} m",
+            f"- 历史训练 P90 海拔：{float(historical_altitude.get('p90_m', 0)):.0f} m",
+            f"- 历史训练最高海拔：{float(historical_altitude.get('max_m', 0)):.0f} m",
+        ]
+    )
+    race_environment = prediction.get("environment", {})
     lines.extend(
         [
         "",
@@ -106,6 +121,9 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         f"- 最终预测（中位 P50）：**{format_duration(float(prediction.get('median_finish_time_seconds', prediction['total_time_seconds'])))}**",
         f"- 保守预测时间 P90：{format_duration(float(prediction.get('conservative_time_seconds', prediction['total_time_seconds'])))}",
         f"- 预测可信度：{float(prediction.get('confidence', 0.2)):.0%}",
+        f"- 比赛预计夜间占比：{float(race_environment.get('race_night_ratio', 0)):.1%}",
+        f"- 比赛平均海拔：{_format_elevation(race_environment.get('race_average_elevation_m'))}",
+        f"- 比赛最高海拔：{_format_elevation(race_environment.get('race_maximum_elevation_m'))}",
         "",
         "### 目标时长能力匹配",
         "",
@@ -116,8 +134,8 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         "| --- | --- | ---: | ---: | --- |",
         "## 分段预测",
         "",
-        "| 公里 | 地形 | 距离 | 平均坡度 | 最大坡度 | 爬升/下降 | 时长适配 | 疲劳因子 | 条件系数 | 预测时间 |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 公里 | 地形 | 距离 | 平均坡度 | 海拔 | 昼夜 | 爬升/下降 | 时长适配 | 疲劳因子 | 海拔系数 | 条件系数 | 预测时间 |",
+        "| --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
@@ -135,10 +153,12 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         lines.append(
             f"| {float(row['start_km']):.1f}-{float(row['end_km']):.1f} | "
             f"{row.get('terrain', row['type'])} | {float(row['distance']) / 1000.0:.2f} km | "
-            f"{float(row['grade']):.1f}% | {float(row.get('max_grade', row['grade'])):.1f}% | "
+            f"{float(row['grade']):.1f}% | {_format_elevation(row.get('environment', {}).get('elevation_m'))} | "
+            f"{'夜间' if row.get('environment', {}).get('night') else '白天'} | "
             f"+{float(row['gain']):.0f}/-{float(row['loss']):.0f} m | "
             f"×{float(row.get('duration_factor', 1)):.3f} | "
             f"{float(row['fatigue_factor']) * 100:.0f}% | "
+            f"×{float(row.get('environment', {}).get('altitude_factor', 1)):.3f} | "
             f"×{float(row.get('condition_factor', 1)):.3f} | "
             f"{format_duration(float(row['predicted_time_seconds']))} |"
         )
@@ -178,3 +198,7 @@ def _sample_pace(sample: dict[str, object], fallback_speed_mps: float | None = N
 def _fatigue_row(time_range: str, retained_ratio: float) -> str:
     safe_ratio = max(retained_ratio, 0.1)
     return f"| {time_range} | {retained_ratio * 100:.0f}% | ×{1.0 / safe_ratio:.2f} |"
+
+
+def _format_elevation(value: object) -> str:
+    return "—" if value is None else f"{float(value):.0f} m"

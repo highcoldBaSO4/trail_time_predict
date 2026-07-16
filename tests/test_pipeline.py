@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -11,10 +12,12 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from analysis.activity_analysis import analyze_activity
+from analysis.activity_selection import apply_activity_review, build_activity_review
 from analysis.capability import build_runner_profile
 from analysis.confidence import calculate_confidence
 from analysis.data_quality import diagnose_fit, diagnose_gpx
 from analysis.downhill import interpolate_downhill_speed
+from analysis.environment import build_environment_profile, relative_altitude_factor, solar_elevation_degrees
 from analysis.fatigue import interpolate_fatigue
 from analysis.uphill import interpolate_uphill_vam
 from config import load_config
@@ -80,6 +83,34 @@ def test_flat_pace_weights_trail_and_discounted_road() -> None:
     assert profile["flat"]["aerobic_pace"] == 468.0
 
 
+def test_activity_review_filters_and_overrides_road_trail_type() -> None:
+    activities = {"training.fit": synthetic_activity(), "short.fit": synthetic_activity(points=5)}
+    rows = build_activity_review(activities)
+    by_name = {row["filename"]: row for row in rows}
+
+    assert by_name["training.fit"]["confirmed_type"] == "road"
+    assert by_name["training.fit"]["use_for_model"] is True
+    assert by_name["short.fit"]["use_for_model"] is False
+    assert "活动时长不足10分钟" in by_name["short.fit"]["quality_issues"]
+
+    by_name["training.fit"]["confirmed_type"] = "trail"
+    selected, activity_types = apply_activity_review(activities, list(by_name.values()))
+    profile = build_runner_profile(selected, activity_types)
+
+    assert list(selected) == ["training.fit"]
+    assert activity_types == {"training.fit": "trail"}
+    assert profile["activities"][0]["activity_type"] == "trail"
+
+
+def test_activity_review_requires_one_selected_activity() -> None:
+    activities = {"training.fit": synthetic_activity()}
+    rows = build_activity_review(activities)
+    rows[0]["use_for_model"] = False
+
+    with pytest.raises(ValueError, match="至少选择一个活动"):
+        apply_activity_review(activities, rows)
+
+
 def test_profile_and_report_expose_four_slope_bands() -> None:
     profile = build_runner_profile({"training.fit": synthetic_activity()})
 
@@ -117,6 +148,7 @@ def test_gpx_segmentation_prediction_and_report() -> None:
     assert 1.0 < summary["distance_km"] < 1.3
     assert summary["climbs"] == 1
     assert summary["descents"] == 1
+    assert {"latitude", "longitude", "elevation", "elevation_available"} <= set(segments[0])
 
     profile = build_runner_profile({"training.fit": synthetic_activity()})
     prediction = predict_race(profile, segments, aid_minutes=10)
@@ -217,6 +249,18 @@ def test_gpx_quality_reports_multiscale_gain() -> None:
     assert set(report["resampled_gain_m"]) == {"50", "100", "200"}
 
 
+def test_solar_position_and_historical_environment_profile() -> None:
+    noon = solar_elevation_degrees(datetime(2026, 3, 20, 12, tzinfo=timezone.utc), 0.0, 0.0)
+    midnight = solar_elevation_degrees(datetime(2026, 3, 20, 0, tzinfo=timezone.utc), 0.0, 0.0)
+    environment = build_environment_profile([synthetic_activity()])
+
+    assert noon > 80
+    assert midnight < -80
+    assert environment["night"]["source"] == "fit_coordinates"
+    assert environment["altitude"]["mean_m"] > 100
+    assert relative_altitude_factor(2500, 500) > 1.0
+
+
 def test_profile_exposes_quality_confidence_and_continuous_curves() -> None:
     profile = build_runner_profile({"training.fit": synthetic_activity()})
     assert profile["schema_version"] == "0.2"
@@ -292,6 +336,41 @@ def test_phase2_monte_carlo_is_reproducible() -> None:
     first = predict_race(profile, segments, simulations=1000, seed=99)
     second = predict_race(profile, segments, simulations=1000, seed=99)
     assert first["probability"] == second["probability"]
+
+
+def test_race_automatically_applies_night_and_altitude_by_segment() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    profile["environment"]["night"]["ratio"] = 0.0
+    segments = [{"distance": 1000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
+                 "type": "flat", "start_km": 0.0, "end_km": 1.0,
+                 "latitude": 0.0, "longitude": 0.0, "elevation": 2500.0,
+                 "elevation_available": True}]
+    night = predict_race(
+        profile,
+        segments,
+        condition=RaceCondition(race_start_time_utc=datetime(2026, 3, 20, 0, tzinfo=timezone.utc)),
+        simulations=1000,
+        seed=5,
+    )
+    day = predict_race(
+        profile,
+        segments,
+        condition=RaceCondition(race_start_time_utc=datetime(2026, 3, 20, 12, tzinfo=timezone.utc)),
+        simulations=1000,
+        seed=5,
+    )
+
+    assert night["segments"][0]["environment"]["night"] is True
+    assert day["segments"][0]["environment"]["night"] is False
+    assert night["segments"][0]["environment"]["altitude_factor"] > 1.0
+    assert night["adjusted_moving_time_seconds"] > day["adjusted_moving_time_seconds"]
+    assert night["environment"]["race_night_ratio"] == 1.0
+    assert day["environment"]["race_maximum_elevation_m"] == 2500.0
+    assert str(night["condition"]["race_start_time_utc"]).endswith("+00:00")
+    report = build_markdown_report(profile, night)
+    assert "历史环境覆盖" in report
+    assert "比赛预计夜间占比" in report
+    assert "海拔系数" in report
 
 
 def test_prediction_result_typed_round_trip_and_order_validation() -> None:

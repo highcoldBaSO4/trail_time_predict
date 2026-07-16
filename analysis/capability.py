@@ -8,9 +8,11 @@ import numpy as np
 import pandas as pd
 
 from analysis.activity_analysis import add_interval_metrics, analyze_activity
+from analysis.activity_selection import infer_activity_type
 from analysis.confidence import aggregate_quality_score, calculate_confidence
 from analysis.data_quality import diagnose_fit
 from analysis.fatigue import build_fatigue_profile
+from analysis.environment import build_environment_profile
 from config import load_config
 from models import RunnerProfile
 from parser.gpx_reader import group_terrain_chunks
@@ -25,7 +27,10 @@ DEFAULT_PROFILE = {
 }
 
 
-def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, object]:
+def build_runner_profile(
+    activities: dict[str, pd.DataFrame],
+    activity_type_overrides: dict[str, str] | None = None,
+) -> dict[str, object]:
     if not activities:
         raise ValueError("至少需要一个 FIT 活动才能生成能力画像")
 
@@ -34,13 +39,15 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
     activity_types: dict[str, str] = {}
     quality_reports: dict[str, dict[str, object]] = {}
     for name, frame in activities.items():
-        activity_type = _activity_type(name, frame)
+        activity_type = (activity_type_overrides or {}).get(name, infer_activity_type(name, frame))
+        if activity_type not in {"trail", "road"}:
+            raise ValueError(f"活动 {name} 的类型无效：{activity_type}")
         activity_types[name] = activity_type
         quality_reports[name] = diagnose_fit(frame)
         activity = add_interval_metrics(frame)
         activity["_activity_name"] = name
         activity["_activity_type"] = activity_type
-        activity["_model_weight"] = _activity_weight(name, activity)
+        activity["_model_weight"] = _activity_weight(name, activity, activity_type)
         activity["_activity_duration_h"] = float(activity["dt_seconds"].fillna(0).clip(lower=0).sum()) / 3600.0
         enriched.append(activity)
         terrain_segments.extend(_activity_terrain_segments(activity, name, activity_type))
@@ -70,6 +77,7 @@ def build_runner_profile(activities: dict[str, pd.DataFrame]) -> dict[str, objec
         "uphill": uphill,
         "downhill": downhill,
         "fatigue": build_fatigue_profile(enriched),
+        "environment": build_environment_profile(enriched),
         "duration_capabilities": duration_capabilities,
         "activities": activity_summaries,
         "terrain_segments": {
@@ -282,14 +290,6 @@ def _build_downhill_profile(segments: pd.DataFrame) -> dict[str, object]:
     return result
 
 
-def _activity_type(name: str, frame: pd.DataFrame) -> str:
-    sub_sport = str(frame.attrs.get("sub_sport") or "").lower()
-    lowered = name.lower()
-    if sub_sport == "trail" or "越野" in name or "trail" in lowered:
-        return "trail"
-    return "road"
-
-
 def _percentile_or_nan(series: pd.Series, percentile: float) -> float:
     return float(np.percentile(series.to_numpy(dtype=float), percentile)) if len(series) else np.nan
 
@@ -306,7 +306,7 @@ def _weighted_percentile(frame: pd.DataFrame, column: str, percentile: float) ->
     return float(values[index])
 
 
-def _activity_weight(name: str, frame: pd.DataFrame) -> float:
+def _activity_weight(name: str, frame: pd.DataFrame, activity_type: str) -> float:
     """Combine configured activity recency and purpose weights."""
     config = load_config()
     valid_time = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True).dropna()
@@ -317,7 +317,7 @@ def _activity_weight(name: str, frame: pd.DataFrame) -> float:
             recency = float(band["weight"])
             break
     lowered = name.lower()
-    purpose = "race" if any(word in lowered for word in ("race", "比赛")) else "recovery" if any(word in lowered for word in ("recovery", "恢复")) else "specific_training" if any(word in lowered for word in ("trail", "越野")) else "normal_training"
+    purpose = "race" if any(word in lowered for word in ("race", "比赛")) else "recovery" if any(word in lowered for word in ("recovery", "恢复")) else "specific_training" if activity_type == "trail" else "normal_training"
     return recency * float(config["activity_type_weights"][purpose])
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -88,8 +89,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mud-level", type=int, choices=range(5), default=0, help="泥泞等级 0-4")
     parser.add_argument("--night-ratio", type=float, default=0.0, help="夜间路段比例 0-1")
     parser.add_argument("--altitude-factor", type=float, default=1.0, help="高海拔耗时系数")
-    parser.add_argument("--carried-weight", type=float, default=0.0, help="携带重量（kg）")
+    parser.add_argument("--carried-weight", type=float, default=0.0, help="相对日常训练额外携带重量（kg）")
+    parser.add_argument(
+        "--race-start",
+        type=_parse_race_start,
+        default=None,
+        help="比赛出发时间，ISO 8601格式并包含时区，例如 2026-08-01T06:00:00+08:00",
+    )
     return parser.parse_args()
+
+
+def _parse_race_start(value: str) -> datetime:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"无效的比赛出发时间：{value}") from exc
+    if parsed.tzinfo is None:
+        raise argparse.ArgumentTypeError("比赛出发时间必须包含时区，例如 +08:00")
+    return parsed.astimezone(timezone.utc)
 
 
 if __name__ == "__main__":
@@ -104,7 +121,7 @@ if __name__ == "__main__":
                                 humidity_percent=args.humidity, altitude_factor=args.altitude_factor,
                                 terrain_technical_level=args.technical_level, mud_level=args.mud_level,
                                 night_running_ratio=args.night_ratio, carried_weight_kg=args.carried_weight,
-                                aid_station_minutes=args.aid_minutes),
+                                aid_station_minutes=args.aid_minutes, race_start_time_utc=args.race_start),
         progress=lambda message: print(message, flush=True),
     )
     print(f"预测完成（P50）：{format_duration(float(result['median_finish_time_seconds']))}")

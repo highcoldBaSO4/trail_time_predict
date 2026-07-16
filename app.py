@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -10,6 +12,7 @@ import pandas as pd
 import streamlit as st
 
 from analysis.capability import build_runner_profile
+from analysis.activity_selection import ACTIVITY_TYPE_LABELS, LABEL_TO_ACTIVITY_TYPE, apply_activity_review, build_activity_review
 from analysis.data_quality import diagnose_gpx
 from models import RaceCondition
 from parser.fit_reader import read_fit
@@ -114,30 +117,20 @@ def step_heading(number: int, text: str) -> None:
 
 
 def calculate_prediction(
-    fit_files: list[Any],
+    activities: dict[str, pd.DataFrame],
+    activity_types: dict[str, str],
     gpx_file: Any,
     sample_distance: float,
     aid_minutes: float,
     condition: RaceCondition | None = None,
     simulations: int = 3000,
 ) -> dict[str, Any]:
-    total_steps = len(fit_files) + 4
+    total_steps = 4
     completed = 0
-    progress = st.progress(0, text="准备读取文件……")
+    progress = st.progress(0, text="准备建立能力画像……")
     with st.status("正在建立个人能力画像", expanded=True) as status:
-        activities: dict[str, pd.DataFrame] = {}
-        for index, uploaded in enumerate(fit_files, start=1):
-            detail = st.empty()
-            detail.write(f"解析 FIT {index}/{len(fit_files)}：{uploaded.name}")
-            activities[uploaded.name] = read_fit(
-                uploaded,
-                progress=lambda message, target=detail: target.write(message.strip()),
-            )
-            completed += 1
-            progress.progress(completed / total_steps, text=f"已完成 {completed}/{total_steps} 个步骤")
-
-        status.write("识别历史活动中的自然爬坡、下降和平路……")
-        profile = build_runner_profile(activities)
+        status.write(f"使用已确认的 {len(activities)} 个活动识别自然爬坡、下降和平路……")
+        profile = build_runner_profile(activities, activity_types)
         completed += 1
         progress.progress(completed / total_steps, text="个人能力画像已生成")
 
@@ -164,6 +157,92 @@ def calculate_prediction(
         status.update(label="计算完成", state="complete", expanded=False)
 
     return {"profile": profile, "prediction": prediction, "report": report}
+
+
+def upload_signature(files: list[Any]) -> str:
+    """Identify the selected upload set so stale reviews are never reused."""
+    digest = hashlib.sha256()
+    for uploaded in files:
+        digest.update(uploaded.name.encode("utf-8", errors="replace"))
+        digest.update(uploaded.getvalue())
+    return digest.hexdigest()
+
+
+def parse_activity_uploads(files: list[Any]) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
+    """Parse uploaded FIT files once and prepare the confirmation rows."""
+    names = [uploaded.name for uploaded in files]
+    if len(names) != len(set(names)):
+        raise ValueError("存在同名 FIT 文件，请重命名后重新上传")
+    activities: dict[str, pd.DataFrame] = {}
+    failures: list[str] = []
+    progress = st.progress(0, text="准备解析活动……")
+    with st.status("正在解析活动并检查数据质量", expanded=True) as status:
+        for index, uploaded in enumerate(files, start=1):
+            detail = st.empty()
+            try:
+                activities[uploaded.name] = read_fit(
+                    uploaded,
+                    progress=lambda message, target=detail: target.write(message.strip()),
+                )
+            except ValueError as exc:
+                failures.append(f"{uploaded.name}：{exc}")
+                detail.error(f"已跳过 {uploaded.name}：{exc}")
+            progress.progress(index / len(files), text=f"已解析 {index}/{len(files)} 个活动")
+        if not activities:
+            raise ValueError("上传的 FIT 文件均无法用于活动确认")
+        status.update(label=f"活动解析完成：成功 {len(activities)} 个，失败 {len(failures)} 个", state="complete")
+    for failure in failures:
+        st.warning(failure)
+    return activities, build_activity_review(activities)
+
+
+def render_activity_review(rows: list[dict[str, Any]], editor_key: str) -> list[dict[str, Any]]:
+    """Render the simplified road/trail review table and return normalized rows."""
+    display = pd.DataFrame(
+        [
+            {
+                "用于建模": row["use_for_model"],
+                "文件名": row["filename"],
+                "日期": row["date"],
+                "距离": row["distance_km"],
+                "时长": row["duration_hour"],
+                "爬升": row["elevation_gain_m"],
+                "自动类型": ACTIVITY_TYPE_LABELS[row["auto_type"]],
+                "确认类型": ACTIVITY_TYPE_LABELS[row["confirmed_type"]],
+                "质量": row["quality_level"],
+                "问题": "；".join(row["quality_issues"]) or "无",
+            }
+            for row in rows
+        ]
+    )
+    edited = st.data_editor(
+        display,
+        hide_index=True,
+        width="stretch",
+        key=editor_key,
+        disabled=["文件名", "日期", "距离", "时长", "爬升", "自动类型", "质量", "问题"],
+        column_config={
+            "用于建模": st.column_config.CheckboxColumn("用于建模", help="取消后该 FIT 不参与能力画像"),
+            "确认类型": st.column_config.SelectboxColumn("确认类型", options=["越野", "路跑"], required=True),
+            "距离": st.column_config.NumberColumn("距离（km）", format="%.2f"),
+            "时长": st.column_config.NumberColumn("时长（h）", format="%.2f"),
+            "爬升": st.column_config.NumberColumn("爬升（m）", format="%.0f"),
+        },
+    )
+    original = {str(row["filename"]): row for row in rows}
+    normalized: list[dict[str, Any]] = []
+    for record in edited.to_dict("records"):
+        source = dict(original[str(record["文件名"])])
+        source["use_for_model"] = bool(record["用于建模"])
+        source["confirmed_type"] = LABEL_TO_ACTIVITY_TYPE[str(record["确认类型"])]
+        normalized.append(source)
+    selected_count = sum(bool(row["use_for_model"]) for row in normalized)
+    not_recommended_count = sum(not bool(row["use_for_model"]) for row in rows)
+    st.caption(
+        f"已选择 {selected_count}/{len(normalized)} 个活动用于建模；"
+        f"系统初始判定不建议建模 {not_recommended_count} 个。"
+    )
+    return normalized
 
 
 def elevation_figure(segments: list[dict[str, Any]]) -> plt.Figure:
@@ -322,6 +401,17 @@ def render_result(result: dict[str, Any]) -> None:
         st.dataframe(breakdown, hide_index=True, width="stretch")
         for note in prediction.get("risk_notes", []):
             st.warning(note)
+        environment = prediction.get("environment", {})
+        st.subheader("自动环境识别")
+        environment_rows = [
+            ["历史夜间占比", f"{float(environment.get('historical_night_ratio', 0)):.1%}"],
+            ["比赛预计夜间占比", f"{float(environment.get('race_night_ratio', 0)):.1%}"],
+            ["历史训练平均海拔", f"{float(environment.get('historical_mean_elevation_m', 0)):.0f} m"],
+            ["历史训练P90海拔", f"{float(environment.get('historical_p90_elevation_m', 0)):.0f} m"],
+            ["比赛平均海拔", "—" if environment.get("race_average_elevation_m") is None else f"{float(environment['race_average_elevation_m']):.0f} m"],
+            ["比赛最高海拔", "—" if environment.get("race_maximum_elevation_m") is None else f"{float(environment['race_maximum_elevation_m']):.0f} m"],
+        ]
+        st.dataframe(pd.DataFrame(environment_rows, columns=["项目", "结果"]), hide_index=True, width="stretch")
 
     with ability_tab:
         flat = profile["flat"]
@@ -361,9 +451,11 @@ def render_result(result: dict[str, Any]) -> None:
     with segment_tab:
         segment_frame = pd.DataFrame(prediction["segments"])
         display = segment_frame[
-            ["start_km", "end_km", "terrain", "distance", "grade", "max_grade", "gain", "loss", "duration_factor", "fatigue_factor", "condition_factor", "predicted_time_seconds"]
+            ["start_km", "end_km", "terrain", "distance", "grade", "max_grade", "gain", "loss", "elevation", "duration_factor", "fatigue_factor", "condition_factor", "predicted_time_seconds"]
         ].copy()
-        display.columns = ["起点km", "终点km", "地形", "距离m", "平均坡度%", "最陡坡度%", "爬升m", "下降m", "时长适配", "疲劳因子", "条件系数", "预测秒"]
+        display["夜间"] = segment_frame["environment"].map(lambda value: "是" if value.get("night") else "否")
+        display["海拔系数"] = segment_frame["environment"].map(lambda value: f"×{float(value.get('altitude_factor', 1)):.3f}")
+        display.columns = ["起点km", "终点km", "地形", "距离m", "平均坡度%", "最陡坡度%", "爬升m", "下降m", "海拔m", "时长适配", "疲劳因子", "条件系数", "预测秒", "夜间", "海拔系数"]
         display["时长适配"] = display["时长适配"].map(lambda factor: f"×{float(factor):.3f}")
         display["疲劳因子"] = display["疲劳因子"].map(lambda factor: f"{float(factor) * 100:.0f}%")
         display["条件系数"] = display["条件系数"].map(lambda factor: f"×{float(factor):.3f}")
@@ -397,7 +489,59 @@ with st.sidebar:
     )
     if fit_files:
         st.caption(f"已选择 {len(fit_files)} 个 FIT 文件")
+        signature = upload_signature(fit_files)
+        if st.session_state.get("fit_upload_signature") != signature:
+            st.session_state["fit_upload_signature"] = signature
+            st.session_state.pop("parsed_activities", None)
+            st.session_state.pop("activity_review_rows", None)
+            st.session_state.pop("activity_review_signature", None)
+            st.session_state.pop("prediction_result", None)
+        if st.button("解析并确认活动", width="stretch", disabled=not fit_files):
+            try:
+                parsed, review_rows = parse_activity_uploads(fit_files)
+                st.session_state["parsed_activities"] = parsed
+                st.session_state["activity_review_rows"] = review_rows
+            except Exception as exc:
+                st.session_state.pop("parsed_activities", None)
+                st.session_state.pop("activity_review_rows", None)
+                st.error(f"活动解析失败：{exc}")
+    else:
+        st.session_state.pop("fit_upload_signature", None)
+        st.session_state.pop("parsed_activities", None)
+        st.session_state.pop("activity_review_rows", None)
+        st.session_state.pop("activity_review_signature", None)
+        st.session_state.pop("prediction_result", None)
 
+st.markdown("# 越野跑比赛时间概率预测")
+st.markdown(
+    '<div class="app-subtitle">结合持续能力、当天状态和比赛条件，输出可解释的 P10–P90 完赛时间区间。</div>',
+    unsafe_allow_html=True,
+)
+
+parsed_activities: dict[str, pd.DataFrame] = st.session_state.get("parsed_activities", {})
+review_rows: list[dict[str, Any]] = st.session_state.get("activity_review_rows", [])
+selected_activities: dict[str, pd.DataFrame] = {}
+confirmed_types: dict[str, str] = {}
+if parsed_activities and review_rows:
+    with st.expander("活动确认与筛选", expanded="prediction_result" not in st.session_state):
+        st.caption("系统先自动判断越野或路跑。请确认类型，并取消不希望进入能力画像的活动。")
+        normalized_review = render_activity_review(
+            review_rows,
+            f"activity_review_{st.session_state.get('fit_upload_signature', 'none')}",
+        )
+    review_signature = tuple(
+        (row["filename"], bool(row["use_for_model"]), row["confirmed_type"])
+        for row in normalized_review
+    )
+    if st.session_state.get("activity_review_signature") != review_signature:
+        st.session_state["activity_review_signature"] = review_signature
+        st.session_state.pop("prediction_result", None)
+    try:
+        selected_activities, confirmed_types = apply_activity_review(parsed_activities, normalized_review)
+    except ValueError as exc:
+        st.warning(str(exc))
+
+with st.sidebar:
     step_heading(2, "上传比赛路线 GPX")
     gpx_file = st.file_uploader("选择一个 .gpx 文件", type=["gpx"])
 
@@ -416,40 +560,49 @@ with st.sidebar:
     temperature = st.number_input("温度（℃）", min_value=-20, max_value=60, value=20, step=1)
     humidity = st.number_input("湿度（%）", min_value=0, max_value=100, value=60, step=5)
     technical_level = st.select_slider("技术难度", options=[0, 1, 2, 3, 4], value=0,
-                                       format_func=lambda value: ["公路/平整林道", "简单山径", "普通山径", "中等技术", "高技术"][value])
-    mud_level = st.select_slider("泥泞等级", options=[0, 1, 2, 3, 4], value=0)
-    night_ratio_percent = st.slider("夜间路段比例（%）", 0, 100, 0, 5)
-    altitude_factor = st.number_input("高海拔耗时系数", min_value=0.80, max_value=1.50, value=1.00, step=0.01)
-    carried_weight = st.number_input("携带重量（kg）", min_value=0.0, max_value=20.0, value=0.0, step=0.5)
+                                       format_func=lambda value: ["接近平时训练", "略难", "更难", "明显更难", "极高技术"][value])
+    mud_level = st.select_slider("相对平时的额外泥泞", options=[0, 1, 2, 3, 4], value=0)
+    carried_weight = st.number_input("比平时额外携带重量（kg）", min_value=0.0, max_value=20.0, value=0.0, step=0.5)
+    st.markdown("**自动夜间与海拔分析**")
+    race_date = st.date_input("比赛日期", value=date.today())
+    race_start_clock = st.time_input("出发时间", value=time(8, 0), step=900)
+    utc_offset = st.selectbox(
+        "比赛时区",
+        options=list(range(-12, 15)),
+        index=20,
+        format_func=lambda value: f"UTC{value:+d}",
+        help="用于将比赛当地出发时间转换为太阳位置计算所需的绝对时间。",
+    )
+    st.caption("夜间路段由比赛时间和路线经纬度自动识别；海拔修正由历史 FIT 与比赛 GPX 自动计算。")
     simulations = st.select_slider("模拟次数", options=[1000, 3000, 5000, 10000], value=3000)
 
     step_heading(4, "开始计算")
-    can_calculate = bool(fit_files and gpx_file)
+    can_calculate = bool(selected_activities and gpx_file)
     if st.button("开始计算", type="primary", disabled=not can_calculate, width="stretch"):
         try:
+            local_start = datetime.combine(race_date, race_start_clock).replace(
+                tzinfo=timezone(timedelta(hours=int(utc_offset)))
+            )
             st.session_state["prediction_result"] = calculate_prediction(
-                fit_files, gpx_file, float(sample_distance), float(aid_minutes),
+                selected_activities, confirmed_types, gpx_file, float(sample_distance), float(aid_minutes),
                 RaceCondition(current_form=form_labels[current_form_label], temperature_c=float(temperature),
-                              humidity_percent=float(humidity), altitude_factor=float(altitude_factor),
+                              humidity_percent=float(humidity), altitude_factor=1.0,
                               terrain_technical_level=int(technical_level), mud_level=int(mud_level),
-                              night_running_ratio=float(night_ratio_percent) / 100.0,
-                              carried_weight_kg=float(carried_weight), aid_station_minutes=float(aid_minutes)),
+                              night_running_ratio=0.0,
+                              carried_weight_kg=float(carried_weight), aid_station_minutes=float(aid_minutes),
+                              race_start_time_utc=local_start.astimezone(timezone.utc)),
                 int(simulations),
             )
         except Exception as exc:
             st.session_state.pop("prediction_result", None)
             st.error(f"计算失败：{exc}")
     if not can_calculate:
-        st.caption("上传 FIT 和 GPX 后即可开始计算。")
-
-st.markdown("# 越野跑比赛时间概率预测")
-st.markdown(
-    '<div class="app-subtitle">结合持续能力、当天状态和比赛条件，输出可解释的 P10–P90 完赛时间区间。</div>',
-    unsafe_allow_html=True,
-)
+        st.caption("解析并确认至少一个 FIT，同时上传 GPX 后即可开始计算。")
 
 if "prediction_result" in st.session_state:
     render_result(st.session_state["prediction_result"])
+elif parsed_activities:
+    st.info("活动已解析。确认上方活动类型和建模选择后，在左侧上传 GPX 并开始计算。")
 else:
     st.markdown(
         """
@@ -457,8 +610,8 @@ else:
             <div class="empty-mark">⌁</div>
             <div class="empty-title">上传数据，开始一次路线预测</div>
             <div class="empty-copy">
-                在左侧选择历史 FIT 活动和比赛 GPX。系统会识别自然爬坡、下降和平路，
-                建立个人能力画像，并生成可在线查看和下载的完整报告。
+                在左侧选择历史 FIT，点击“解析并确认活动”。确认越野/路跑类型后上传比赛 GPX，
+                系统将建立个人能力画像并生成概率预测报告。
             </div>
         </div>
         """,

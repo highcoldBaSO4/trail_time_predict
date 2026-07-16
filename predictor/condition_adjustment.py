@@ -4,14 +4,23 @@ from config import load_config
 from models import RaceCondition
 
 
-def condition_factors(condition: RaceCondition, terrain: str) -> dict[str, float]:
+def condition_factors(
+    condition: RaceCondition,
+    terrain: str,
+    target_night_ratio: float | None = None,
+    historical_night_ratio: float = 0.0,
+    automatic_altitude_factor: float | None = None,
+) -> dict[str, float]:
     """Return explainable time multipliers for one terrain segment."""
     condition = condition.normalized()
     config = load_config()["conditions"]
     form_entry = config["current_form"].get(condition.current_form, config["current_form"]["normal"])
     technical = float(config["technical_factors"][condition.terrain_technical_level][terrain])
     mud = 1.0 + condition.mud_level * float(config["mud_per_level"][terrain])
-    night = 1.0 + condition.night_running_ratio * float(config["night_max"][terrain])
+    target_night = condition.night_running_ratio if target_night_ratio is None else max(0.0, min(1.0, target_night_ratio))
+    historical_night = max(0.0, min(1.0, historical_night_ratio))
+    night_penalty = float(config["night_max"][terrain])
+    night = (1.0 + target_night * night_penalty) / (1.0 + historical_night * night_penalty)
     weight = 1.0 + condition.carried_weight_kg * float(config["carried_weight_per_kg"][terrain])
     heat_config = config["heat"]
     heat = 1.0
@@ -24,7 +33,7 @@ def condition_factors(condition: RaceCondition, terrain: str) -> dict[str, float
         "technical": technical,
         "mud": mud,
         "night": night,
-        "altitude": float(condition.altitude_factor),
+        "altitude": float(condition.altitude_factor if automatic_altitude_factor is None else automatic_altitude_factor),
         "carried_weight": weight,
         "weather": heat,
     }

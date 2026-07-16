@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,7 @@ class RaceCondition:
     night_running_ratio: float = 0.0
     carried_weight_kg: float = 0.0
     aid_station_minutes: float = 0.0
+    race_start_time_utc: datetime | None = None
 
     def normalized(self) -> "RaceCondition":
         """Clamp user-controlled fields to safe model ranges."""
@@ -27,7 +29,10 @@ class RaceCondition:
             night_running_ratio=max(0.0, min(1.0, self.night_running_ratio)),
             carried_weight_kg=max(0.0, self.carried_weight_kg),
             aid_station_minutes=max(0.0, self.aid_station_minutes),
+            race_start_time_utc=self.race_start_time_utc,
         )
 
     def to_dict(self) -> dict[str, object]:
-        return asdict(self)
+        data = asdict(self)
+        data["race_start_time_utc"] = self.race_start_time_utc.isoformat() if self.race_start_time_utc else None
+        return data

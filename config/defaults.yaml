@@ -47,6 +47,16 @@ quality:
 terrain:
   flat_grade_abs_percent: 2.0
 
+environment:
+  night_solar_elevation_degrees: -6.0
+  altitude:
+    threshold_m: 1500.0
+    time_increase_per_1000m: 0.04
+    coverage_margin_m: 500.0
+    confidence_penalty: 0.08
+    minimum_relative_factor: 0.90
+    maximum_relative_factor: 1.30
+
 duration_capability:
   layers:
     - {name: short, label: 短时, min_hours: 0.0, max_hours: 2.0, center_hours: 1.0, fallback_time_factor: 0.96}
