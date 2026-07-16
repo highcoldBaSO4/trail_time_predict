@@ -1,5 +1,13 @@
 # 越野跑比赛时间概率预测系统 V0.3
 
+## 在线体验
+
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://trail-time-predict.streamlit.app)
+
+> 上述地址需要先在 Streamlit Community Cloud 中创建应用；若实际子域名不同，请将链接替换为部署后获得的公开地址。
+
+在线版支持一次上传最多 30 个 FIT 文件和 1 个 GPX 文件。单个文件不得超过 20 MB，本次上传总量不得超过 100 MB。FIT/GPX 可能包含精确位置、活动时间、心率等隐私信息；上传内容只用于当前会话分析，不会写入代码仓库或作为用户数据长期保存。
+
 本项目是一个本地运行的 Python 工具。系统读取个人历史 FIT 活动和比赛 GPX 路线，建立平路、上坡、下坡、持续能力及疲劳画像，并输出带可信度和 P10/P50/P90 区间的完赛时间预测。
 
 所有 FIT 和 GPX 数据仅在当前电脑中处理，不依赖数据库或云端服务。
@@ -80,6 +88,18 @@ http://localhost:8501
 5. 填写比赛状态、条件、日期、出发时间和时区。
 6. 选择保守、标准或积极比赛强度策略。
 7. 点击“开始计算”，查看或下载预测报告。
+
+## Streamlit Community Cloud 部署
+
+1. 将代码推送到 GitHub 仓库 `highcoldBaSO4/trail_time_predict` 的 `main` 分支。
+2. 登录 [Streamlit Community Cloud](https://share.streamlit.io/)，授权访问该仓库并新建应用。
+3. Repository 选择 `highcoldBaSO4/trail_time_predict`，Branch 填 `main`，Main file path 填 `app.py`。
+4. 点击 Deploy，并在构建日志中确认依赖安装和应用启动成功。
+5. 部署成功后，将本 README 顶部的在线体验链接替换为实际公开地址。
+
+项目当前不依赖外部密钥。未来如增加 API，请通过 Streamlit Secrets 配置，不要将真实密钥提交到 GitHub。
+
+常见问题：若构建提示缺少包，请检查 `requirements.txt`；若页面无法打开，请确认入口为 `app.py`；若文件被拒绝，请检查扩展名和上述上传限额。损坏或没有有效轨迹记录的 FIT/GPX 会显示友好错误，其他有效 FIT 仍可继续处理。
 
 不建议用于建模的活动默认不会被选中，用户仍可手动调整。
 

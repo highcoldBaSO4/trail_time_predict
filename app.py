@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 import tempfile
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
@@ -26,6 +27,13 @@ from predictor.report import build_markdown_report
 
 plt.rcParams["font.sans-serif"] = ["Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
 plt.rcParams["axes.unicode_minus"] = False
+
+logger = logging.getLogger(__name__)
+
+MAX_FIT_FILES = 30
+MAX_SINGLE_FILE_MB = 20
+MAX_TOTAL_UPLOAD_MB = 100
+BYTES_PER_MB = 1024 * 1024
 
 HEART_RATE_GRADE_BANDS = (
     ("flat", "flat", "平路", "±2%"),
@@ -200,8 +208,29 @@ def upload_signature(files: list[Any]) -> str:
     return digest.hexdigest()
 
 
+def validate_uploads(fit_files: list[Any], gpx_file: Any | None = None) -> None:
+    """Enforce resource limits before parsing user-provided files."""
+    if len(fit_files) > MAX_FIT_FILES:
+        raise ValueError(f"最多上传 {MAX_FIT_FILES} 个 FIT 文件。")
+
+    uploads = [*fit_files, *([gpx_file] if gpx_file is not None else [])]
+    oversized = [item.name for item in uploads if len(item.getvalue()) > MAX_SINGLE_FILE_MB * BYTES_PER_MB]
+    if oversized:
+        raise ValueError(f"单个文件不能超过 {MAX_SINGLE_FILE_MB} MB：{', '.join(oversized)}")
+
+    total_bytes = sum(len(item.getvalue()) for item in uploads)
+    if total_bytes > MAX_TOTAL_UPLOAD_MB * BYTES_PER_MB:
+        raise ValueError(f"本次上传总大小不能超过 {MAX_TOTAL_UPLOAD_MB} MB。")
+
+    logger.info(
+        "upload validation succeeded: fit_count=%d file_count=%d total_bytes=%d",
+        len(fit_files), len(uploads), total_bytes,
+    )
+
+
 def parse_activity_uploads(files: list[Any]) -> tuple[dict[str, pd.DataFrame], list[dict[str, Any]]]:
     """Parse FIT files, attach historical weather, then prepare review rows."""
+    validate_uploads(files)
     names = [uploaded.name for uploaded in files]
     if len(names) != len(set(names)):
         raise ValueError("存在同名 FIT 文件，请重命名后重新上传")
@@ -771,6 +800,11 @@ with st.sidebar:
         accept_multiple_files=True,
         help="建议同时包含路跑、越野跑和长距离活动。",
     )
+    st.caption("最多 30 个 FIT；单个文件不超过 20 MB；FIT 与 GPX 总计不超过 100 MB。")
+    st.info(
+        "隐私提示：FIT 和 GPX 可能包含精确位置、活动时间、心率等信息。"
+        "文件仅用于当前会话分析，不会写入项目仓库或作为用户数据长期保存。"
+    )
     if fit_files:
         st.caption(f"已选择 {len(fit_files)} 个 FIT 文件")
         signature = upload_signature(fit_files)
@@ -785,10 +819,15 @@ with st.sidebar:
                 parsed, review_rows = parse_activity_uploads(fit_files)
                 st.session_state["parsed_activities"] = parsed
                 st.session_state["activity_review_rows"] = review_rows
-            except Exception as exc:
+            except ValueError as exc:
                 st.session_state.pop("parsed_activities", None)
                 st.session_state.pop("activity_review_rows", None)
-                st.error(f"活动解析失败：{exc}")
+                st.warning(str(exc))
+            except Exception:
+                st.session_state.pop("parsed_activities", None)
+                st.session_state.pop("activity_review_rows", None)
+                logger.exception("FIT upload processing failed")
+                st.error("活动分析过程中出现异常，请检查上传文件后重试。")
     else:
         st.session_state.pop("fit_upload_signature", None)
         st.session_state.pop("parsed_activities", None)
@@ -888,6 +927,7 @@ with st.sidebar:
     can_calculate = bool(selected_activities and gpx_file)
     if st.button("开始计算", type="primary", disabled=not can_calculate, width="stretch"):
         try:
+            validate_uploads(fit_files, gpx_file)
             local_start = datetime.combine(race_date, race_start_clock).replace(
                 tzinfo=timezone(timedelta(hours=int(utc_offset)))
             )
@@ -902,9 +942,13 @@ with st.sidebar:
                               race_start_time_utc=local_start.astimezone(timezone.utc)),
                 int(simulations),
             )
-        except Exception as exc:
+        except ValueError as exc:
             st.session_state.pop("prediction_result", None)
-            st.error(f"计算失败：{exc}")
+            st.warning(str(exc))
+        except Exception:
+            st.session_state.pop("prediction_result", None)
+            logger.exception("prediction failed")
+            st.error("分析过程中出现异常，请检查上传文件后重试。")
     if not can_calculate:
         st.caption("解析并确认至少一个 FIT，同时上传 GPX 后即可开始计算。")
 
