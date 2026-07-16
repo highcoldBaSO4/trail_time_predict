@@ -405,6 +405,8 @@ def render_result(result: dict[str, Any]) -> None:
         st.subheader("自动环境识别")
         environment_rows = [
             ["历史夜间占比", f"{float(environment.get('historical_night_ratio', 0)):.1%}"],
+            ["历史夜间上坡占比", f"{float(environment.get('historical_night_by_terrain', {}).get('uphill', 0)):.1%}"],
+            ["历史夜间下坡占比", f"{float(environment.get('historical_night_by_terrain', {}).get('downhill', 0)):.1%}"],
             ["比赛预计夜间占比", f"{float(environment.get('race_night_ratio', 0)):.1%}"],
             ["历史训练平均海拔", f"{float(environment.get('historical_mean_elevation_m', 0)):.0f} m"],
             ["历史训练P90海拔", f"{float(environment.get('historical_p90_elevation_m', 0)):.0f} m"],

@@ -341,8 +341,8 @@ def test_phase2_monte_carlo_is_reproducible() -> None:
 def test_race_automatically_applies_night_and_altitude_by_segment() -> None:
     profile = build_runner_profile({"training.fit": synthetic_activity()})
     profile["environment"]["night"]["ratio"] = 0.0
-    segments = [{"distance": 1000.0, "gain": 0.0, "loss": 0.0, "grade": 0.0,
-                 "type": "flat", "start_km": 0.0, "end_km": 1.0,
+    segments = [{"distance": 1000.0, "gain": 100.0, "loss": 0.0, "grade": 10.0,
+                 "type": "uphill", "start_km": 0.0, "end_km": 1.0,
                  "latitude": 0.0, "longitude": 0.0, "elevation": 2500.0,
                  "elevation_available": True}]
     night = predict_race(
@@ -371,6 +371,42 @@ def test_race_automatically_applies_night_and_altitude_by_segment() -> None:
     assert "历史环境覆盖" in report
     assert "比赛预计夜间占比" in report
     assert "海拔系数" in report
+
+
+def test_night_penalty_ignores_flat_but_affects_slopes() -> None:
+    from predictor.condition_adjustment import condition_factors
+
+    condition = RaceCondition(night_running_ratio=1.0)
+
+    assert condition_factors(condition, "flat")["night"] == pytest.approx(1.0)
+    assert condition_factors(condition, "uphill")["night"] > 1.0
+    assert condition_factors(condition, "downhill")["night"] > condition_factors(condition, "uphill")["night"]
+
+
+def test_historical_night_flat_does_not_reduce_slope_night_penalty() -> None:
+    flat = synthetic_activity()
+    flat["altitude"] = 100.0
+    flat["latitude"] = 0.0
+    flat["longitude"] = 0.0
+    flat["timestamp"] = pd.date_range("2026-03-20T00:00:00Z", periods=len(flat), freq="10s")
+    profile = build_runner_profile({"night_flat.fit": flat})
+
+    assert profile["environment"]["night"]["terrain"]["flat"]["ratio"] == 1.0
+    assert profile["environment"]["night"]["terrain"]["uphill"]["ratio"] == 0.0
+    segments = [{"distance": 1000.0, "gain": 100.0, "loss": 0.0, "grade": 10.0,
+                 "type": "uphill", "start_km": 0.0, "end_km": 1.0,
+                 "latitude": 0.0, "longitude": 0.0, "elevation": 100.0,
+                 "elevation_available": True}]
+    prediction = predict_race(
+        profile,
+        segments,
+        condition=RaceCondition(race_start_time_utc=datetime(2026, 3, 20, 0, tzinfo=timezone.utc)),
+        simulations=1000,
+        seed=13,
+    )
+
+    assert prediction["segments"][0]["environment"]["historical_night_ratio"] == 0.0
+    assert prediction["segments"][0]["condition_factors"]["night"] == pytest.approx(1.05)
 
 
 def test_prediction_result_typed_round_trip_and_order_validation() -> None:

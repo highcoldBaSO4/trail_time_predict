@@ -91,6 +91,7 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
                   f"- 建议用于建模：{int(quality.get('recommended_count', 0))}/{int(profile.get('sample_count', 0))} 个活动"])
     historical_environment = profile.get("environment", {})
     historical_night = historical_environment.get("night", {})
+    night_terrain = historical_night.get("terrain", {})
     historical_altitude = historical_environment.get("altitude", {})
     lines.extend(
         [
@@ -98,6 +99,8 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
             "### 历史环境覆盖",
             "",
             f"- 历史夜间运动占比：{float(historical_night.get('ratio', 0)):.1%}",
+            f"- 历史夜间上坡占比：{float(night_terrain.get('uphill', {}).get('ratio', 0)):.1%}",
+            f"- 历史夜间下坡占比：{float(night_terrain.get('downhill', {}).get('ratio', 0)):.1%}",
             f"- 历史训练平均海拔：{float(historical_altitude.get('mean_m', 0)):.0f} m",
             f"- 历史训练 P90 海拔：{float(historical_altitude.get('p90_m', 0)):.0f} m",
             f"- 历史训练最高海拔：{float(historical_altitude.get('max_m', 0)):.0f} m",

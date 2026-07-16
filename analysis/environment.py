@@ -45,6 +45,9 @@ def build_environment_profile(activities: list[pd.DataFrame]) -> dict[str, Any]:
     """Summarize historical night exposure and altitude coverage from FIT tracks."""
     night_seconds = 0.0
     geo_seconds = 0.0
+    terrain_night_seconds = {"flat": 0.0, "uphill": 0.0, "downhill": 0.0}
+    terrain_geo_seconds = {"flat": 0.0, "uphill": 0.0, "downhill": 0.0}
+    flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
     altitude_values: list[float] = []
     altitude_weights: list[float] = []
     for frame in activities:
@@ -53,13 +56,23 @@ def build_environment_profile(activities: list[pd.DataFrame]) -> dict[str, Any]:
         latitude = pd.to_numeric(frame["latitude"], errors="coerce")
         longitude = pd.to_numeric(frame["longitude"], errors="coerce")
         altitude = pd.to_numeric(frame["altitude"], errors="coerce")
+        grade_source = frame["grade_pct"] if "grade_pct" in frame else pd.Series(np.nan, index=frame.index)
+        grade = pd.to_numeric(grade_source, errors="coerce")
         valid_time = seconds.between(0.2, 120.0)
         for index in frame.index[valid_time]:
             duration = float(seconds.loc[index])
             if np.isfinite(latitude.loc[index]) and np.isfinite(longitude.loc[index]):
                 geo_seconds += duration
-                if is_night(timestamps.loc[index], float(latitude.loc[index]), float(longitude.loc[index])):
+                terrain = (
+                    "uphill" if np.isfinite(grade.loc[index]) and grade.loc[index] > flat_limit
+                    else "downhill" if np.isfinite(grade.loc[index]) and grade.loc[index] < -flat_limit
+                    else "flat"
+                )
+                terrain_geo_seconds[terrain] += duration
+                night = is_night(timestamps.loc[index], float(latitude.loc[index]), float(longitude.loc[index]))
+                if night:
                     night_seconds += duration
+                    terrain_night_seconds[terrain] += duration
             if np.isfinite(altitude.loc[index]):
                 altitude_values.append(float(altitude.loc[index]))
                 altitude_weights.append(duration)
@@ -80,6 +93,15 @@ def build_environment_profile(activities: list[pd.DataFrame]) -> dict[str, Any]:
             "night_seconds": round(night_seconds, 1),
             "sample_duration_seconds": round(geo_seconds, 1),
             "source": "fit_coordinates" if geo_seconds > 0 else "unavailable",
+            "terrain": {
+                terrain: {
+                    "ratio": round(terrain_night_seconds[terrain] / terrain_geo_seconds[terrain], 4)
+                    if terrain_geo_seconds[terrain] > 0 else 0.0,
+                    "night_seconds": round(terrain_night_seconds[terrain], 1),
+                    "sample_duration_seconds": round(terrain_geo_seconds[terrain], 1),
+                }
+                for terrain in ("flat", "uphill", "downhill")
+            },
         },
         "altitude": {
             "mean_m": round(mean_altitude, 1),

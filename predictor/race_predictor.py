@@ -235,7 +235,11 @@ def _segment_environment(
     apply_environment: bool,
 ) -> dict[str, object]:
     history = profile.get("environment", {})
-    historical_night = float(history.get("night", {}).get("ratio", 0.0)) if apply_environment else 0.0
+    night_history = history.get("night", {})
+    historical_night = (
+        float(night_history.get("terrain", {}).get(str(segment.get("type", "flat")), {}).get("ratio", night_history.get("ratio", 0.0)))
+        if apply_environment else 0.0
+    )
     target_night = float(condition.night_running_ratio) if apply_environment else 0.0
     solar_elevation: float | None = None
     night = target_night >= 0.5
@@ -283,6 +287,10 @@ def _environment_summary(profile: dict[str, object], rows: list[dict[str, object
     maximum_elevation = max((float(row["environment"]["elevation_m"]) for row in altitude_rows), default=None)
     return {
         "historical_night_ratio": float(profile.get("environment", {}).get("night", {}).get("ratio", 0.0)),
+        "historical_night_by_terrain": {
+            terrain: float(profile.get("environment", {}).get("night", {}).get("terrain", {}).get(terrain, {}).get("ratio", 0.0))
+            for terrain in ("flat", "uphill", "downhill")
+        },
         "race_night_ratio": round(night_seconds / total_seconds, 4) if total_seconds > 0 else 0.0,
         "race_night_seconds": round(night_seconds, 1),
         "historical_mean_elevation_m": float(profile.get("environment", {}).get("altitude", {}).get("mean_m", 0.0)),

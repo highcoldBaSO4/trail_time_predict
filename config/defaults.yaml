@@ -80,7 +80,7 @@ conditions:
     3: {flat: 1.05, uphill: 1.07, downhill: 1.16}
     4: {flat: 1.08, uphill: 1.12, downhill: 1.28}
   mud_per_level: {flat: 0.015, uphill: 0.025, downhill: 0.04}
-  night_max: {flat: 0.03, uphill: 0.05, downhill: 0.10}
+  night_max: {flat: 0.00, uphill: 0.05, downhill: 0.10}
   carried_weight_per_kg: {flat: 0.003, uphill: 0.006, downhill: 0.002}
   heat:
     threshold_c: 20.0
