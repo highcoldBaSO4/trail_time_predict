@@ -9,7 +9,8 @@ import pandas as pd
 from analysis.activity_analysis import add_interval_metrics
 from analysis.capability import build_runner_profile
 from analysis.data_quality import diagnose_fit, diagnose_gpx
-from models import PerformanceResult, RaceCondition
+from models.performance_result import PerformanceResult
+from models.race_condition import RaceCondition
 from parser.gpx_reader import build_race_segments
 from predictor.race_predictor import predict_race
 
