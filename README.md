@@ -2,9 +2,9 @@
 
 ## 在线体验
 
-[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://trail-time-predict.streamlit.app)
+[![Open in Streamlit](https://static.streamlit.io/badges/streamlit_badge_black_white.svg)](https://trailtimepredict-6shfrlujn4hz2qynprfeps.streamlit.app/)
 
-> 上述地址需要先在 Streamlit Community Cloud 中创建应用；若实际子域名不同，请将链接替换为部署后获得的公开地址。
+> 在线地址：https://trailtimepredict-6shfrlujn4hz2qynprfeps.streamlit.app/
 
 在线版支持一次上传最多 30 个 FIT 文件和 1 个 GPX 文件。单个文件不得超过 20 MB，本次上传总量不得超过 100 MB。FIT/GPX 可能包含精确位置、活动时间、心率等隐私信息；上传内容只用于当前会话分析，不会写入代码仓库或作为用户数据长期保存。
 
