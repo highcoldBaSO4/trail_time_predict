@@ -13,6 +13,7 @@ import pandas as pd
 import streamlit as st
 
 from analysis.capability import build_runner_profile
+from analysis.performance import analyze_performance
 from analysis.activity_selection import ACTIVITY_TYPE_LABELS, LABEL_TO_ACTIVITY_TYPE, apply_activity_review, build_activity_review
 from analysis.data_quality import diagnose_gpx
 from analysis.temperature import calibrate_activity_temperature
@@ -23,6 +24,7 @@ from parser.fit_reader import read_fit
 from parser.gpx_reader import build_race_segments, read_gpx
 from predictor.race_predictor import format_duration, format_pace, predict_race
 from predictor.report import build_markdown_report
+from predictor.performance_report import build_performance_report
 
 
 plt.rcParams["font.sans-serif"] = ["Noto Sans CJK SC", "Microsoft YaHei", "SimHei", "Arial Unicode MS", "DejaVu Sans"]
@@ -66,7 +68,7 @@ HEART_RATE_INTENSITIES = (
 )
 
 st.set_page_config(
-    page_title="越野跑比赛时间预测",
+    page_title="越野跑预测与表现诊断",
     page_icon="⛰️",
     layout="wide",
     initial_sidebar_state="collapsed",
@@ -93,6 +95,38 @@ def inject_styles() -> None:
             border-right: 1px solid var(--trail-border);
         }
         [data-testid="stSidebar"] > div:first-child { padding-top: 1.5rem; }
+        .mode-switch-label {
+            color: var(--trail-muted); font-size: .76rem; font-weight: 650;
+            letter-spacing: .04em; margin: 0 0 .4rem .1rem;
+        }
+        [data-testid="stSidebar"] div[role="radiogroup"] {
+            display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .25rem;
+            padding: .25rem; border: 1px solid #e4e9ee; border-radius: 10px;
+            background: #f1f4f6;
+        }
+        [data-testid="stSidebar"] div[role="radiogroup"] label {
+            min-width: 0; min-height: 2.35rem; margin: 0; padding: .45rem .3rem;
+            display: flex; align-items: center; justify-content: center;
+            border: 1px solid transparent; border-radius: 7px; cursor: pointer;
+            transition: background-color .16s ease, border-color .16s ease, box-shadow .16s ease;
+        }
+        [data-testid="stSidebar"] div[role="radiogroup"] label:hover {
+            background: rgba(255, 255, 255, .72);
+        }
+        [data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) {
+            background: #fff; border-color: #cfe2d6;
+            box-shadow: 0 1px 3px rgba(16, 24, 40, .08);
+        }
+        [data-testid="stSidebar"] div[role="radiogroup"] label > div:first-child {
+            display: none;
+        }
+        [data-testid="stSidebar"] div[role="radiogroup"] label p {
+            margin: 0; color: #59636e; font-size: .82rem; font-weight: 620;
+            line-height: 1.2; white-space: nowrap;
+        }
+        [data-testid="stSidebar"] div[role="radiogroup"] label:has(input:checked) p {
+            color: var(--trail-green-dark); font-weight: 720;
+        }
         .block-container { max-width: 1500px; padding-top: 1.35rem; padding-bottom: 3rem; }
         h1, h2, h3 { color: var(--trail-text); letter-spacing: -.02em; }
         h1 { font-size: 1.85rem !important; font-weight: 720 !important; margin-bottom: .2rem !important; }
@@ -868,7 +902,296 @@ def render_result(result: dict[str, Any]) -> None:
         )
 
 
+def render_performance_result(result: dict[str, Any]) -> None:
+    diagnosis = result["diagnosis"]
+    prediction_range = diagnosis.get("prediction_range", {})
+    metric1, metric2, metric3, metric4, metric5 = st.columns(5)
+    metric1.metric("实际经过时间", format_duration(float(diagnosis["actual_elapsed_seconds"])))
+    metric2.metric("FIT 计时时间", format_duration(float(diagnosis["actual_timer_seconds"])))
+    metric3.metric("估算移动时间", format_duration(float(diagnosis["actual_moving_seconds"])))
+    metric4.metric(
+        "模型预测移动时间",
+        format_duration(float(diagnosis["predicted_moving_seconds"])),
+        delta=f"实际 {float(diagnosis['deviation_percent']):+.1f}%",
+        delta_color="inverse",
+    )
+    metric5.metric("实际表现百分位", f"P{float(diagnosis['prediction_percentile']):.0f}")
+    st.caption(
+        f"{diagnosis.get('performance_label', '—')}；诊断可信度 {float(diagnosis['confidence']):.0%}。"
+        f"暂停或未计时约 {format_duration(float(diagnosis.get('paused_seconds', 0)))}，"
+        f"计时中的停留约 {format_duration(float(diagnosis.get('nonmoving_timer_seconds', 0)))}。"
+    )
+
+    st.subheader("活动海拔与实际速度")
+    figure = elevation_figure(
+        result["prediction"]["segments"],
+        actual_trace=list(result.get("activity_trace", [])),
+    )
+    st.pyplot(figure, width="stretch")
+    plt.close(figure)
+
+    summary_tab, terrain_tab, segment_tab, report_tab = st.tabs(
+        ["诊断概览", "分地形表现", "自然坡明细", "完整报告"]
+    )
+    with summary_tab:
+        st.subheader("模型预测区间")
+        interval = pd.DataFrame(
+            [
+                ["P10 最快合理", format_duration(float(prediction_range.get("p10_seconds", 0)))],
+                ["P50 中位预测", format_duration(float(prediction_range.get("p50_seconds", 0)))],
+                ["P90 保守预测", format_duration(float(prediction_range.get("p90_seconds", 0)))],
+                ["FIT 计时时间", format_duration(float(diagnosis["actual_timer_seconds"]))],
+                ["估算移动时间", format_duration(float(diagnosis["actual_moving_seconds"]))],
+            ],
+            columns=["项目", "时间"],
+        )
+        st.dataframe(interval, hide_index=True, width="stretch")
+        st.subheader("前后半程")
+        progress_rows = []
+        for key, label in (("first_half", "前半程"), ("second_half", "后半程")):
+            values = diagnosis.get("progress_analysis", {}).get(key, {})
+            progress_rows.append(
+                [
+                    label,
+                    format_duration(float(values.get("predicted_seconds", 0))),
+                    format_duration(float(values.get("actual_seconds", 0))),
+                    format_duration(float(values.get("deviation_seconds", 0))),
+                    f"{float(values.get('deviation_percent', 0)):+.1f}%",
+                ]
+            )
+        st.dataframe(
+            pd.DataFrame(progress_rows, columns=["阶段", "预测", "实际", "偏差", "偏差比例"]),
+            hide_index=True,
+            width="stretch",
+        )
+        st.info("当前为 V0.4 Phase 1 基础对比。技术难度、泥泞、负重和主观状态未知时保持中性，不会强行解释剩余偏差。")
+
+    with terrain_tab:
+        terrain_rows = []
+        labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
+        for terrain in ("flat", "uphill", "downhill"):
+            values = diagnosis.get("terrain_analysis", {}).get(terrain, {})
+            terrain_rows.append(
+                [
+                    labels[terrain],
+                    format_duration(float(values.get("predicted_seconds", 0))),
+                    format_duration(float(values.get("actual_seconds", 0))),
+                    format_duration(float(values.get("deviation_seconds", 0))),
+                    f"{float(values.get('deviation_percent', 0)):+.1f}%",
+                ]
+            )
+        st.dataframe(
+            pd.DataFrame(terrain_rows, columns=["地形", "预测时间", "实际时间", "偏差", "偏差比例"]),
+            hide_index=True,
+            width="stretch",
+        )
+
+    with segment_tab:
+        segments = pd.DataFrame(diagnosis.get("segments", []))
+        if segments.empty:
+            st.info("没有可展示的自然坡对比结果。")
+        else:
+            segments = segments.rename(
+                columns={
+                    "start_km": "起点km", "end_km": "终点km", "terrain_label": "地形",
+                    "grade": "坡度%", "distance_m": "距离m", "predicted_seconds": "预测秒",
+                    "actual_seconds": "实际秒", "deviation_seconds": "偏差秒",
+                    "deviation_percent": "偏差%", "average_hr_bpm": "平均HR",
+                }
+            )
+            segments["预测时间"] = segments.pop("预测秒").map(lambda value: format_duration(float(value)))
+            segments["实际时间"] = segments.pop("实际秒").map(lambda value: format_duration(float(value)))
+            segments["偏差时间"] = segments.pop("偏差秒").map(lambda value: format_duration(float(value)))
+            columns = ["起点km", "终点km", "地形", "坡度%", "距离m", "预测时间", "实际时间", "偏差时间", "偏差%", "平均HR"]
+            st.dataframe(segments[columns], hide_index=True, width="stretch", height=460)
+
+    with report_tab:
+        st.markdown(result["report"])
+        download1, download2 = st.columns(2)
+        with download1:
+            st.download_button(
+                "下载诊断报告",
+                result["report"],
+                "activity_performance_report.md",
+                "text/markdown",
+                width="stretch",
+            )
+        with download2:
+            st.download_button(
+                "下载诊断 JSON",
+                json.dumps(result, ensure_ascii=False, indent=2, default=str),
+                "activity_performance.json",
+                "application/json",
+                width="stretch",
+            )
+
+
+def render_performance_workflow() -> None:
+    with st.sidebar:
+        st.markdown('<div class="sidebar-title">活动表现诊断工作流</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sidebar-copy">历史基准 FIT 用于建立能力画像；待诊断 FIT 只参与表现对比，两者不会混用。</div>',
+            unsafe_allow_html=True,
+        )
+        step_heading(1, "上传历史基准 FIT")
+        baseline_files = st.file_uploader(
+            "选择多个历史 .fit 文件",
+            type=["fit"],
+            accept_multiple_files=True,
+            key="diagnosis_baseline_files",
+            help="不要包含下面要诊断的目标活动。建议包含多条越野、路跑和长距离记录。",
+        )
+        if baseline_files:
+            baseline_signature = upload_signature(baseline_files)
+            if st.session_state.get("diagnosis_baseline_signature") != baseline_signature:
+                st.session_state["diagnosis_baseline_signature"] = baseline_signature
+                for key in ("diagnosis_baseline_activities", "diagnosis_review_rows", "diagnosis_review_signature", "diagnosis_result"):
+                    st.session_state.pop(key, None)
+            if st.button("解析并确认基准活动", width="stretch", key="diagnosis_parse_baseline"):
+                try:
+                    parsed, rows = parse_activity_uploads(baseline_files)
+                    st.session_state["diagnosis_baseline_activities"] = parsed
+                    st.session_state["diagnosis_review_rows"] = rows
+                except ValueError as exc:
+                    st.warning(str(exc))
+                except Exception:
+                    logger.exception("diagnosis baseline parsing failed")
+                    st.error("基准活动解析过程中出现异常，请检查文件后重试。")
+        else:
+            for key in ("diagnosis_baseline_signature", "diagnosis_baseline_activities", "diagnosis_review_rows", "diagnosis_review_signature", "diagnosis_result"):
+                st.session_state.pop(key, None)
+
+    st.markdown("# 越野跑活动表现诊断")
+    st.markdown(
+        '<div class="app-subtitle">使用独立历史能力画像，判断一条已完成活动是否符合预期，并比较分地形与前后半程表现。</div>',
+        unsafe_allow_html=True,
+    )
+    baseline_activities: dict[str, pd.DataFrame] = st.session_state.get("diagnosis_baseline_activities", {})
+    review_rows: list[dict[str, Any]] = st.session_state.get("diagnosis_review_rows", [])
+    selected_baseline: dict[str, pd.DataFrame] = {}
+    baseline_types: dict[str, str] = {}
+    if baseline_activities and review_rows:
+        with st.expander("基准活动确认与筛选", expanded="diagnosis_result" not in st.session_state):
+            normalized = render_activity_review(
+                review_rows,
+                f"diagnosis_review_{st.session_state.get('diagnosis_baseline_signature', 'none')}",
+            )
+        signature = tuple((row["filename"], bool(row["use_for_model"]), row["confirmed_type"]) for row in normalized)
+        if st.session_state.get("diagnosis_review_signature") != signature:
+            st.session_state["diagnosis_review_signature"] = signature
+            st.session_state.pop("diagnosis_result", None)
+        try:
+            selected_baseline, baseline_types = apply_activity_review(baseline_activities, normalized)
+        except ValueError as exc:
+            st.warning(str(exc))
+
+    with st.sidebar:
+        step_heading(2, "上传待诊断活动 FIT")
+        target_file = st.file_uploader(
+            "选择一个已完成活动 .fit 文件",
+            type=["fit"],
+            key="diagnosis_target_file",
+        )
+        st.caption("诊断路线直接使用该 FIT 中的经纬度和海拔记录。")
+        target_signature = upload_signature([target_file]) if target_file is not None else None
+        if st.session_state.get("diagnosis_target_signature") != target_signature:
+            st.session_state["diagnosis_target_signature"] = target_signature
+            st.session_state.pop("diagnosis_result", None)
+
+        step_heading(3, "诊断参数")
+        sample_distance = st.number_input(
+            "坡度采样窗口（米）",
+            min_value=50,
+            max_value=500,
+            value=100,
+            step=50,
+            key="diagnosis_sample_distance",
+        )
+        simulations = st.select_slider(
+            "模拟次数",
+            options=[1000, 3000, 5000, 10000],
+            value=3000,
+            key="diagnosis_simulations",
+        )
+        step_heading(4, "开始诊断")
+        can_analyze = bool(selected_baseline and target_file)
+        if st.button("开始活动表现诊断", type="primary", disabled=not can_analyze, width="stretch", key="diagnosis_run"):
+            try:
+                validate_uploads([*baseline_files, target_file])
+                target_hash = hashlib.sha256(target_file.getvalue()).hexdigest()
+                baseline_hashes = {
+                    hashlib.sha256(item.getvalue()).hexdigest()
+                    for item in baseline_files
+                    if item.name in selected_baseline
+                }
+                if target_hash in baseline_hashes:
+                    raise ValueError("待诊断 FIT 同时出现在历史基准中，请从基准活动里移除该文件，避免数据泄漏。")
+                with st.status("正在进行活动表现诊断", expanded=True) as status:
+                    status.write("解析待诊断 FIT 并匹配历史天气……")
+                    parsed_target = read_fit(target_file, progress=lambda message: status.write(message.strip()))
+                    parsed_target = calibrate_activity_temperature(parsed_target)
+                    parsed_target = enrich_activity_with_historical_weather(
+                        parsed_target,
+                        target_file.name,
+                        progress=lambda message: status.write(message.strip()),
+                    )
+                    analyzed = analyze_performance(
+                        selected_baseline,
+                        baseline_types,
+                        parsed_target,
+                        target_file.name,
+                        sample_distance_m=float(sample_distance),
+                        simulations=int(simulations),
+                        progress=lambda message: status.write(message.strip()),
+                    )
+                    analyzed["report"] = build_performance_report(analyzed)
+                    st.session_state["diagnosis_result"] = analyzed
+                    status.update(label="活动表现诊断完成", state="complete", expanded=False)
+            except ValueError as exc:
+                st.session_state.pop("diagnosis_result", None)
+                st.warning(str(exc))
+            except Exception as exc:
+                st.session_state.pop("diagnosis_result", None)
+                logger.exception("performance diagnosis failed")
+                st.error(f"活动表现诊断过程中出现异常：{exc}")
+        if not can_analyze:
+            st.caption("解析并确认基准 FIT，再上传一个独立的待诊断 FIT 后即可开始。")
+
+    if "diagnosis_result" in st.session_state:
+        render_performance_result(st.session_state["diagnosis_result"])
+    elif baseline_activities:
+        st.info("基准活动已解析。请确认活动类型，再在左侧上传一个独立的待诊断 FIT。")
+    else:
+        st.markdown(
+            """
+            <div class="empty-state">
+                <div class="empty-mark">⌁</div>
+                <div class="empty-title">建立独立基准，理解一次真实表现</div>
+                <div class="empty-copy">
+                    先上传历史基准 FIT 并完成确认，再上传一条不参与基准画像的目标 FIT。
+                    系统会比较模型预期与实际移动时间、分地形表现和前后半程偏差。
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 inject_styles()
+
+with st.sidebar:
+    st.markdown('<div class="mode-switch-label">功能模式</div>', unsafe_allow_html=True)
+    app_mode = st.radio(
+        "功能模式",
+        options=["比赛时间预测", "活动表现诊断"],
+        index=0,
+        key="app_mode",
+        label_visibility="collapsed",
+    )
+    st.divider()
+if app_mode == "活动表现诊断":
+    render_performance_workflow()
+    st.stop()
 
 with st.sidebar:
     st.markdown('<div class="sidebar-title">预测工作流</div>', unsafe_allow_html=True)

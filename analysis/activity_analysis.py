@@ -4,8 +4,13 @@ import numpy as np
 import pandas as pd
 
 
+MOVEMENT_WINDOW_SECONDS = 15
+MINIMUM_MOVEMENT_SPEED_MPS = 0.05
+MAXIMUM_MOVEMENT_SPEED_MPS = 12.0
+
+
 def add_interval_metrics(frame: pd.DataFrame) -> pd.DataFrame:
-    """Add robust point-to-point metrics used by all capability models."""
+    """Add point and rolling movement metrics used by all capability models."""
     source_attrs = dict(frame.attrs)
     data = frame.copy().sort_values("timestamp").reset_index(drop=True)
     data["dt_seconds"] = data["timestamp"].diff().dt.total_seconds()
@@ -26,6 +31,43 @@ def add_interval_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     data["valid_interval"] = valid
     data.loc[~valid, ["speed_mps", "grade_pct"]] = np.nan
     data["grade_pct"] = data["grade_pct"].clip(-60.0, 60.0)
+
+    # FIT distance is commonly quantized: a slow climb may be recorded as
+    # 0 m, 0 m, 1 m on three consecutive seconds. Requiring every individual
+    # record to contain distance therefore drops real movement and makes pace
+    # look too fast. A centred time window assigns those seconds the local
+    # movement speed/grade while still excluding sustained stops.
+    timestamp = pd.to_datetime(data["timestamp"], errors="coerce", utc=True)
+    interval_valid = (
+        timestamp.notna()
+        & data["dt_seconds"].between(0.2, 120.0)
+        & data["dd_m"].between(0.0, 1000.0)
+    )
+    rolling_values = pd.DataFrame(
+        {
+            "distance": data["dd_m"].where(interval_valid, 0.0).clip(lower=0.0),
+            "seconds": data["dt_seconds"].where(interval_valid, 0.0).clip(lower=0.0),
+            "elevation": data["delev_m"].where(interval_valid, 0.0),
+        }
+    )
+    usable_timestamp = timestamp.notna()
+    rolling_source = rolling_values.loc[usable_timestamp].copy()
+    rolling_source.index = pd.DatetimeIndex(timestamp.loc[usable_timestamp])
+    rolling = rolling_source.rolling(
+        f"{MOVEMENT_WINDOW_SECONDS}s", center=True, min_periods=1
+    ).sum()
+    rolling_speed = rolling["distance"] / rolling["seconds"].replace(0.0, np.nan)
+    rolling_grade = rolling["elevation"] / rolling["distance"].replace(0.0, np.nan) * 100.0
+    data["movement_speed_mps"] = np.nan
+    data["movement_grade_pct"] = np.nan
+    data.loc[usable_timestamp, "movement_speed_mps"] = rolling_speed.to_numpy()
+    data.loc[usable_timestamp, "movement_grade_pct"] = rolling_grade.clip(-60.0, 60.0).to_numpy()
+    data["moving_interval"] = (
+        interval_valid
+        & data["movement_speed_mps"].between(
+            MINIMUM_MOVEMENT_SPEED_MPS, MAXIMUM_MOVEMENT_SPEED_MPS
+        )
+    )
     data.attrs.update(source_attrs)
     return data
 

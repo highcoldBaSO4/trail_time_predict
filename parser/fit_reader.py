@@ -130,6 +130,8 @@ def read_fit(
     frame.attrs["temperature_source"] = temperature_stats["source"]
     frame.attrs["temperature_source_counts"] = temperature_stats["counts"]
     frame.attrs["temperature_measurement"] = "wrist_device"
+    frame.attrs["total_elapsed_time"] = _optional_positive_number(session_values.get("total_elapsed_time"))
+    frame.attrs["total_timer_time"] = _optional_positive_number(session_values.get("total_timer_time"))
     if temperature_stats["fallback_count"]:
         _emit(
             progress,
@@ -201,6 +203,11 @@ def _fill_average_temperatures(
 def _utc_timestamp(value: object) -> pd.Timestamp | None:
     timestamp = pd.to_datetime(value, errors="coerce", utc=True)
     return None if pd.isna(timestamp) else pd.Timestamp(timestamp)
+
+
+def _optional_positive_number(value: object) -> float | None:
+    numeric = pd.to_numeric(value, errors="coerce")
+    return float(numeric) if pd.notna(numeric) and float(numeric) > 0 else None
 
 
 def read_fit_directory(

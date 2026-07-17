@@ -55,8 +55,12 @@ def build_fatigue_profile(activities: list[pd.DataFrame]) -> dict[str, object]:
 
 
 def _terrain_samples(activity: pd.DataFrame, terrain: str) -> pd.DataFrame:
-    valid = activity[activity["valid_interval"].fillna(False)].copy()
-    valid["elapsed_h"] = valid["dt_seconds"].fillna(0).cumsum() / 3600.0
+    moving = activity["moving_interval"].fillna(False)
+    moving_elapsed = activity["dt_seconds"].where(moving, 0.0).fillna(0.0).cumsum() / 3600.0
+    valid = activity[moving].copy()
+    valid["elapsed_h"] = moving_elapsed.loc[valid.index]
+    valid["grade_pct"] = valid["movement_grade_pct"]
+    valid["speed_mps"] = valid["movement_speed_mps"]
     grade = valid["grade_pct"]
     flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
     mask = (
@@ -67,7 +71,9 @@ def _terrain_samples(activity: pd.DataFrame, terrain: str) -> pd.DataFrame:
         else grade < -flat_limit
     )
     selected = valid[mask].copy()
-    selected["vam"] = selected["delev_m"].clip(lower=0) / selected["dt_seconds"] * 3600.0
+    selected["vam"] = (
+        selected["speed_mps"] * selected["grade_pct"].clip(lower=0.0) / 100.0 * 3600.0
+    )
     return selected
 
 

@@ -260,18 +260,22 @@ def heart_rate_heat_fatigue_time_factor(
 
 def _prepare_samples(activity: pd.DataFrame, fatigue_profile: dict[str, object]) -> pd.DataFrame:
     config = load_config()["temperature_model"]
-    required = {"valid_interval", "dt_seconds", "dd_m", "speed_mps", "grade_pct", "delev_m", "temperature"}
+    required = {
+        "moving_interval", "dt_seconds", "movement_speed_mps",
+        "movement_grade_pct", "temperature",
+    }
     if not required <= set(activity.columns):
         return pd.DataFrame()
     valid = (
-        activity["valid_interval"].fillna(False)
+        activity["moving_interval"].fillna(False)
         & activity["temperature"].between(float(config["valid_min_c"]), float(config["valid_max_c"]))
         & activity["dt_seconds"].between(0.2, 120.0)
-        & (activity["dd_m"] > 0)
     )
     data = activity.loc[valid].copy()
     if data.empty:
         return data
+    data["speed_mps"] = data["movement_speed_mps"]
+    data["grade_pct"] = data["movement_grade_pct"]
     flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
     data["terrain"] = np.where(
         data["grade_pct"] > flat_limit,
@@ -280,7 +284,12 @@ def _prepare_samples(activity: pd.DataFrame, fatigue_profile: dict[str, object])
     )
     data["output"] = data["speed_mps"]
     uphill = data["terrain"] == "uphill"
-    data.loc[uphill, "output"] = data.loc[uphill, "delev_m"].clip(lower=0) / data.loc[uphill, "dt_seconds"] * 3600.0
+    data.loc[uphill, "output"] = (
+        data.loc[uphill, "speed_mps"]
+        * data.loc[uphill, "grade_pct"].clip(lower=0.0)
+        / 100.0
+        * 3600.0
+    )
     data = data[np.isfinite(data["output"]) & (data["output"] > 0)].copy()
     if data.empty:
         return data

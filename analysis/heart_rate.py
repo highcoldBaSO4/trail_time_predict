@@ -161,18 +161,22 @@ def interpolate_hr_drift(profile: dict[str, object], elapsed_hours: float) -> fl
 
 def _prepare_samples(activity: pd.DataFrame) -> pd.DataFrame:
     config = load_config()["heart_rate_model"]
-    required = {"valid_interval", "dt_seconds", "dd_m", "speed_mps", "grade_pct", "delev_m", "heart_rate"}
+    required = {
+        "moving_interval", "dt_seconds", "movement_speed_mps",
+        "movement_grade_pct", "heart_rate",
+    }
     if not required <= set(activity.columns):
         return pd.DataFrame()
     valid = (
-        activity["valid_interval"].fillna(False)
+        activity["moving_interval"].fillna(False)
         & activity["heart_rate"].between(float(config["valid_min_bpm"]), float(config["valid_max_bpm"]))
         & activity["dt_seconds"].between(0.2, 120.0)
-        & (activity["dd_m"] > 0)
     )
     data = activity.loc[valid].copy()
     if data.empty:
         return data
+    data["speed_mps"] = data["movement_speed_mps"]
+    data["grade_pct"] = data["movement_grade_pct"]
     flat_limit = float(load_config()["terrain"]["flat_grade_abs_percent"])
     data["terrain"] = np.where(
         data["grade_pct"] > flat_limit,
@@ -180,14 +184,15 @@ def _prepare_samples(activity: pd.DataFrame) -> pd.DataFrame:
         np.where(data["grade_pct"] < -flat_limit, "downhill", "flat"),
     )
     data["output"] = data["speed_mps"]
+    vertical_speed = data["speed_mps"] * data["grade_pct"] / 100.0 * 3600.0
     uphill = data["terrain"] == "uphill"
-    data.loc[uphill, "output"] = data.loc[uphill, "delev_m"].clip(lower=0) / data.loc[uphill, "dt_seconds"] * 3600.0
+    data.loc[uphill, "output"] = vertical_speed.loc[uphill].clip(lower=0.0)
     data["vertical_speed_mph"] = np.where(
         data["terrain"] == "uphill",
         data["output"],
         np.where(
             data["terrain"] == "downhill",
-            data["delev_m"] / data["dt_seconds"] * 3600.0,
+            vertical_speed,
             0.0,
         ),
     )

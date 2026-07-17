@@ -48,6 +48,7 @@ SLOPE_STYLES = {
 def elevation_figure(
     segments: list[dict[str, Any]],
     *,
+    actual_trace: list[dict[str, Any]] | None = None,
     figsize: tuple[float, float] = (11, 5.2),
 ) -> plt.Figure:
     detailed = [
@@ -117,6 +118,35 @@ def elevation_figure(
     axis.spines[["top", "right", "left"]].set_visible(False)
     axis.spines["bottom"].set_color("#dfe4ea")
     axis.tick_params(colors="#667085", labelsize=9)
+
+    if actual_trace:
+        speed_axis = axis.twinx()
+        trace_distance = [float(item["distance_km"]) for item in actual_trace]
+        trace_speed = [float(item["speed_kmh"]) for item in actual_trace]
+        speed_axis.plot(
+            trace_distance,
+            trace_speed,
+            color="#087E5B",
+            linewidth=1.65,
+            alpha=0.9,
+            label="实际速度",
+            zorder=5,
+        )
+        speed_axis.set_ylabel("实际速度（km/h）", color="#087E5B")
+        speed_axis.tick_params(axis="y", colors="#087E5B", labelsize=9)
+        speed_axis.spines[["top", "left"]].set_visible(False)
+        speed_axis.spines["right"].set_color("#b9d8cd")
+        speed_axis.set_ylim(bottom=0.0)
+        axis.text(
+            0.995,
+            0.975,
+            "绿色曲线：实际速度（100m分箱，3点中值平滑）",
+            transform=axis.transAxes,
+            ha="right",
+            va="top",
+            color="#087E5B",
+            fontsize=8.3,
+        )
     figure.tight_layout()
     return figure
 

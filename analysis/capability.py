@@ -54,7 +54,10 @@ def build_runner_profile(
         activity["_activity_name"] = name
         activity["_activity_type"] = activity_type
         activity["_model_weight"] = _activity_weight(name, activity, activity_type)
-        activity["_activity_duration_h"] = float(activity["dt_seconds"].fillna(0).clip(lower=0).sum()) / 3600.0
+        moving = activity["moving_interval"].fillna(False)
+        activity["_activity_duration_h"] = float(
+            activity.loc[moving, "dt_seconds"].fillna(0).clip(lower=0).sum()
+        ) / 3600.0
         enriched.append(activity)
         terrain_segments.extend(_activity_terrain_segments(activity, name, activity_type))
     segment_frame = pd.DataFrame(terrain_segments)
@@ -176,8 +179,7 @@ def _activity_terrain_segments(
     activity: pd.DataFrame, activity_name: str, activity_type: str, sample_distance_m: float = 100.0
 ) -> list[dict[str, float | str]]:
     valid = (
-        activity["valid_interval"].fillna(False)
-        & (activity["dd_m"] > 0)
+        activity["moving_interval"].fillna(False)
         & activity["delev_m"].notna()
     )
     block_ids = (~valid).cumsum()
@@ -188,11 +190,11 @@ def _activity_terrain_segments(
         distance = block["dd_m"].to_numpy(dtype=float)
         seconds = block["dt_seconds"].to_numpy(dtype=float)
         elevation = block["delev_m"].to_numpy(dtype=float)
-        total_distance = float(distance.sum())
+        total_distance = float(np.clip(distance, 0.0, None).sum())
         if total_distance < 1.0:
             continue
 
-        cumulative_distance = np.concatenate(([0.0], np.cumsum(distance)))
+        cumulative_distance = np.concatenate(([0.0], np.cumsum(np.clip(distance, 0.0, None))))
         cumulative_seconds = np.concatenate(([0.0], np.cumsum(seconds)))
         cumulative_elevation = np.concatenate(([0.0], np.cumsum(elevation)))
         heart_rate = pd.to_numeric(block.get("heart_rate"), errors="coerce").to_numpy(dtype=float)
@@ -200,6 +202,17 @@ def _activity_terrain_segments(
         heart_rate_seconds = np.where(np.isfinite(heart_rate), heart_rate * seconds, 0.0)
         cumulative_hr_valid = np.concatenate(([0.0], np.cumsum(heart_rate_valid_seconds)))
         cumulative_hr_seconds = np.concatenate(([0.0], np.cumsum(heart_rate_seconds)))
+        # Keep the first occurrence of a repeated distance. This assigns time
+        # from quantized 0 m records to the following distance update instead
+        # of silently removing slow uphill seconds from the pace model.
+        cumulative_distance, unique_index = np.unique(cumulative_distance, return_index=True)
+        cumulative_seconds = cumulative_seconds[unique_index]
+        cumulative_elevation = cumulative_elevation[unique_index]
+        cumulative_hr_valid = cumulative_hr_valid[unique_index]
+        cumulative_hr_seconds = cumulative_hr_seconds[unique_index]
+        total_distance = float(cumulative_distance[-1])
+        if total_distance < 1.0:
+            continue
         edges = np.arange(0.0, total_distance, sample_distance_m)
         if total_distance - edges[-1] > 1e-6:
             edges = np.append(edges, total_distance)
