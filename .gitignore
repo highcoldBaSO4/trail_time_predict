@@ -18,6 +18,7 @@ ENV/
 # Packaging and test output
 build/
 dist/
+artifacts/
 *.egg-info/
 .coverage
 .coverage.*

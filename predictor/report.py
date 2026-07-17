@@ -273,8 +273,8 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         "| --- | --- | ---: | ---: | --- |",
         "## 分段预测",
         "",
-        "| 公里 | 地形 | 距离 | 平均坡度 | 强度 | 目标HR | 心率配速 | 海拔 | 昼夜 | 爬升/下降 | 时长适配 | 疲劳因子 | 温度疲劳 | HR疲劳 | 海拔系数 | 条件系数 | 预测时间 |",
-        "| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| 公里 | 地形 | 距离 | 平均坡度 | 强度 | 目标HR | 目标配速 | 心率配速 | 海拔 | 昼夜 | 爬升/下降 | 时长适配 | 疲劳因子 | 温度疲劳 | HR疲劳 | 海拔系数 | 条件系数 | 预测时间 |",
+        "| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
@@ -348,11 +348,16 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
     ] + [""]
     for row in prediction["segments"]:
         pacing = row.get("physiology", {}).get("pacing", {})
+        distance_km = float(row["distance"]) / 1000.0
+        target_pace = (
+            "—" if distance_km <= 0
+            else f"{format_pace(float(row['predicted_time_seconds']) / distance_km)}/km"
+        )
         lines.append(
             f"| {float(row['start_km']):.1f}-{float(row['end_km']):.1f} | "
-            f"{row.get('terrain', row['type'])} | {float(row['distance']) / 1000.0:.2f} km | "
+            f"{row.get('terrain', row['type'])} | {distance_km:.2f} km | "
             f"{float(row['grade']):.1f}% | {pacing.get('intensity_label', '—')} | "
-            f"{_bpm_value(pacing.get('target_hr_bpm'))} | ×{float(pacing.get('time_factor', 1)):.3f} | "
+            f"{_bpm_value(pacing.get('target_hr_bpm'))} | {target_pace} | ×{float(pacing.get('time_factor', 1)):.3f} | "
             f"{_format_elevation(row.get('environment', {}).get('elevation_m'))} | "
             f"{'夜间' if row.get('environment', {}).get('night') else '白天'} | "
             f"+{float(row['gain']):.0f}/-{float(row['loss']):.0f} m | "

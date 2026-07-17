@@ -9,7 +9,7 @@ from analysis.capability import build_runner_profile, save_runner_profile
 from parser.fit_reader import read_fit_directory
 from parser.gpx_reader import build_race_segments, read_gpx, save_segments
 from analysis.data_quality import diagnose_gpx
-from elevation_chart import save_elevation_chart
+from ui.elevation_chart import save_elevation_chart
 from models import RaceCondition
 from predictor.race_predictor import format_duration, predict_race, save_prediction
 from predictor.report import build_markdown_report, save_markdown_report

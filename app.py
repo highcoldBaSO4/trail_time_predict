@@ -17,7 +17,7 @@ from analysis.activity_selection import ACTIVITY_TYPE_LABELS, LABEL_TO_ACTIVITY_
 from analysis.data_quality import diagnose_gpx
 from analysis.temperature import calibrate_activity_temperature
 from analysis.weather import enrich_activity_with_historical_weather
-from elevation_chart import elevation_figure
+from ui.elevation_chart import elevation_figure
 from models import RaceCondition
 from parser.fit_reader import read_fit
 from parser.gpx_reader import build_race_segments, read_gpx
@@ -833,11 +833,30 @@ def render_result(result: dict[str, Any]) -> None:
         )
         display["心率配速"] = physiology_series.map(lambda value: f"×{float(value.get('pacing', {}).get('time_factor', 1)):.3f}")
         display.columns = ["起点km", "终点km", "地形", "距离m", "平均坡度%", "最陡坡度%", "爬升m", "下降m", "海拔m", "时长适配", "疲劳因子", "条件系数", "预测秒", "夜间", "海拔系数", "温度疲劳", "HR疲劳", "强度", "目标HR", "心率配速"]
+        display["目标配速"] = [
+            "—" if float(distance) <= 0 else f"{format_pace(float(seconds) / (float(distance) / 1000.0))}/km"
+            for distance, seconds in zip(display["距离m"], display["预测秒"])
+        ]
         display["时长适配"] = display["时长适配"].map(lambda factor: f"×{float(factor):.3f}")
         display["疲劳因子"] = display["疲劳因子"].map(lambda factor: f"{float(factor) * 100:.0f}%")
         display["条件系数"] = display["条件系数"].map(lambda factor: f"×{float(factor):.3f}")
         display["预测时间"] = display.pop("预测秒").map(lambda seconds: format_duration(float(seconds)))
-        st.dataframe(display, hide_index=True, width="stretch", height=460)
+        default_columns = [
+            "起点km", "终点km", "地形", "距离m", "平均坡度%", "爬升m", "下降m",
+            "强度", "目标HR", "目标配速", "预测时间",
+        ]
+        with st.expander("展示列设置", expanded=False):
+            selected_columns = st.multiselect(
+                "选择需要展示的列",
+                options=list(display.columns),
+                default=default_columns,
+                key="natural_segment_display_columns",
+                help="默认展示路线和目标配速等核心信息；可按需增加坡度极值、环境及各类修正系数。",
+            )
+        if selected_columns:
+            st.dataframe(display[selected_columns], hide_index=True, width="stretch", height=460)
+        else:
+            st.info("请在“展示列设置”中至少选择一列。")
 
     with report_tab:
         st.markdown(result["report"])

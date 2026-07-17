@@ -8,7 +8,7 @@ from typing import Callable
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
-from runtime_paths import weather_cache_directory
+from desktop.runtime_paths import weather_cache_directory
 
 import numpy as np
 import pandas as pd

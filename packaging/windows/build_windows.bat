@@ -1,6 +1,6 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0..\.."
 
 if not exist ".venv\Scripts\python.exe" (
   echo Virtual environment not found. Run: python -m venv .venv
@@ -17,14 +17,14 @@ if errorlevel 1 (
 )
 
 echo Building TrailTimePredictor portable edition...
-".venv\Scripts\python.exe" -m PyInstaller --clean --noconfirm trail_predictor.spec
+".venv\Scripts\python.exe" -m PyInstaller --clean --noconfirm --workpath artifacts\windows\build --distpath artifacts\windows\dist packaging\windows\trail_predictor.spec
 if errorlevel 1 (
   echo Build failed. Check the output above.
   pause
   exit /b 1
 )
 
-copy /Y "PORTABLE_README.txt" "dist\TrailTimePredictor\使用说明.txt" >nul
+copy /Y "packaging\windows\PORTABLE_README.txt" "artifacts\windows\dist\TrailTimePredictor\使用说明.txt" >nul
 echo.
-echo Build completed: dist\TrailTimePredictor\TrailTimePredictor.exe
+echo Build completed: artifacts\windows\dist\TrailTimePredictor\TrailTimePredictor.exe
 pause

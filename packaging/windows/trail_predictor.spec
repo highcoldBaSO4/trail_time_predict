@@ -5,16 +5,17 @@ from PyInstaller.utils.hooks import collect_all, copy_metadata
 
 
 streamlit_datas, streamlit_binaries, streamlit_hiddenimports = collect_all("streamlit")
+project_root = Path(SPECPATH).resolve().parents[1]
 
 datas = streamlit_datas + copy_metadata("streamlit") + [
-    ("app.py", "."),
-    ("config/defaults.yaml", "config"),
-    (".streamlit/config.toml", ".streamlit"),
+    (str(project_root / "app.py"), "."),
+    (str(project_root / "config" / "defaults.yaml"), "config"),
+    (str(project_root / ".streamlit" / "config.toml"), ".streamlit"),
 ]
 
 a = Analysis(
-    ["desktop_launcher.py"],
-    pathex=["."],
+    [str(project_root / "desktop" / "launcher.py")],
+    pathex=[str(project_root)],
     binaries=streamlit_binaries,
     datas=datas,
     hiddenimports=streamlit_hiddenimports + ["app"],

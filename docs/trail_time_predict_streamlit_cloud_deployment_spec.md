@@ -48,7 +48,7 @@ app.py
 streamlit run app.py
 ```
 
-云端不依赖 `start_web.bat`。Windows 批处理文件只用于本地运行。
+云端不依赖 `scripts/start_web.bat`。Windows 批处理文件只用于本地运行。
 
 ## 4. Codex 执行任务
 

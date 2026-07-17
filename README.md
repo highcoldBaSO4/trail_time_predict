@@ -29,6 +29,7 @@
 - 从稳定运动窗口建立“地形 × 坡度 × 心率强度”输出曲线，支持保守、标准和积极比赛策略
 - 将温度直接影响、高温后程疲劳和个人心率热应激分开计算，避免重复惩罚
 - 在网页中展示能力、路线、分段、时间损耗和完整报告
+- 自然坡分段表支持按需选择展示列，并显示包含全部修正后的分段目标配速
 - 下载 Markdown 报告和预测 JSON
 
 ## 环境要求
@@ -37,6 +38,28 @@
 - Windows、macOS 或 Linux
 
 主要依赖统一记录在 `requirements.txt`，开发测试依赖记录在 `requirements-dev.txt`。
+
+## 项目结构
+
+```text
+trail_predictor/
+├── app.py                    # Streamlit 网页入口
+├── main.py                   # 命令行入口
+├── analysis/                 # 活动分析与个人能力建模
+├── parser/                   # FIT、GPX 解析
+├── predictor/                # 比赛预测与报告生成
+├── models/                   # 类型化数据模型
+├── ui/                       # 页面图表组件
+├── desktop/                  # Windows 桌面启动与运行时支持
+├── config/                   # 模型默认配置
+├── packaging/windows/        # Windows 便携版构建文件
+├── scripts/                  # 本地辅助脚本
+├── tests/                    # 自动化测试
+├── docs/                     # 版本与部署文档
+├── data/                     # 本地 FIT、GPX 和天气缓存
+├── output/                   # 命令行预测结果
+└── artifacts/windows/        # Windows 构建过程与便携版成品（可再生）
+```
 
 ## 安装
 
@@ -64,7 +87,7 @@ macOS 或 Linux 使用：
 Windows 可以直接双击：
 
 ```text
-start_web.bat
+scripts/start_web.bat
 ```
 
 也可以从命令行启动：
@@ -111,16 +134,19 @@ http://localhost:8501
 .\.venv\Scripts\python.exe -m pip install -r requirements-build.txt
 ```
 
-双击 `build_windows.bat`，或执行：
+双击 `packaging/windows/build_windows.bat`，或执行：
 
 ```powershell
-.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm trail_predictor.spec
+.\.venv\Scripts\python.exe -m PyInstaller --clean --noconfirm `
+  --workpath artifacts\windows\build `
+  --distpath artifacts\windows\dist `
+  packaging\windows\trail_predictor.spec
 ```
 
 构建结果位于：
 
 ```text
-dist/TrailTimePredictor/TrailTimePredictor.exe
+artifacts/windows/dist/TrailTimePredictor/TrailTimePredictor.exe
 ```
 
 分发时必须保留整个 `TrailTimePredictor` 目录，不能只复制 EXE。应用启动后会显示本地控制窗口，等待服务就绪后自动打开浏览器；关闭控制窗口会同时停止后台服务。天气缓存和运行日志保存在 `%LOCALAPPDATA%\TrailTimePredictor`。

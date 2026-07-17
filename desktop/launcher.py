@@ -14,7 +14,7 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox
 
-from runtime_paths import resource_root, user_data_directory
+from desktop.runtime_paths import resource_root, user_data_directory
 
 
 APP_TITLE = "越野跑比赛时间预测"

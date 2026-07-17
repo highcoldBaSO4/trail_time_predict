@@ -12,7 +12,7 @@ APP_DIRECTORY_NAME = "TrailTimePredictor"
 def resource_root() -> Path:
     """Return the source directory or PyInstaller's bundled resource directory."""
     bundled = getattr(sys, "_MEIPASS", None)
-    return Path(bundled) if bundled else Path(__file__).resolve().parent
+    return Path(bundled) if bundled else Path(__file__).resolve().parents[1]
 
 
 def user_data_directory() -> Path:
@@ -28,6 +28,6 @@ def weather_cache_directory(configured_path: str) -> Path:
     if getattr(sys, "frozen", False):
         target = user_data_directory() / "weather_cache"
     else:
-        target = Path(__file__).resolve().parent / configured_path
+        target = Path(__file__).resolve().parents[1] / configured_path
     target.mkdir(parents=True, exist_ok=True)
     return target

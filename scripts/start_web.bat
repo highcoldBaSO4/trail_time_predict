@@ -1,5 +1,6 @@
 @echo off
-cd /d "%~dp0"
+setlocal
+cd /d "%~dp0.."
 if not exist ".venv\Scripts\python.exe" (
   echo Virtual environment not found. Run: python -m venv .venv
   pause
