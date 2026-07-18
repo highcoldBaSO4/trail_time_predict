@@ -8,22 +8,24 @@ from matplotlib import font_manager
 from matplotlib.lines import Line2D
 
 
-FONT_PATH = Path(__file__).resolve().parent / "assets" / "fonts" / "NotoSansCJKsc-Regular.otf"
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+FONT_PATH = PROJECT_ROOT / "assets" / "fonts" / "NotoSansCJKsc-Regular.otf"
 CHINESE_FONT_FAMILY = "Noto Sans CJK SC"
 
 
 def configure_chart_font() -> None:
     """Register the bundled CJK font for Linux-based cloud deployments."""
-    if FONT_PATH.is_file():
-        font_manager.fontManager.addfont(FONT_PATH)
-        plt.rcParams["font.family"] = "sans-serif"
-        plt.rcParams["font.sans-serif"] = [
-            CHINESE_FONT_FAMILY,
-            "Microsoft YaHei",
-            "SimHei",
-            "Arial Unicode MS",
-            "DejaVu Sans",
-        ]
+    if not FONT_PATH.is_file():
+        raise RuntimeError(f"Bundled chart font is missing: {FONT_PATH}")
+    font_manager.fontManager.addfont(FONT_PATH)
+    plt.rcParams["font.family"] = "sans-serif"
+    plt.rcParams["font.sans-serif"] = [
+        CHINESE_FONT_FAMILY,
+        "Microsoft YaHei",
+        "SimHei",
+        "Arial Unicode MS",
+        "DejaVu Sans",
+    ]
     plt.rcParams["axes.unicode_minus"] = False
 
 
