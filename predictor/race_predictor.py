@@ -22,6 +22,7 @@ from models import PredictionResult, RaceCondition, RunnerProfile
 from parser.gpx_reader import route_summary
 from predictor.condition_adjustment import condition_factors
 from predictor.duration_adjustment import duration_match
+from predictor.pacing_strategy import match_route_pacing_strategy, pacing_factor
 from predictor.probability import simulate_segmented_finish_times
 
 
@@ -48,8 +49,9 @@ def predict_race(
     standard_rows: list[dict[str, object]] = []
     standard_seconds = 0.0
     for iteration in range(1, int(duration_config["max_iterations"]) + 1):
+        route_pacing_match = match_route_pacing_strategy(profile, segments, estimate_hours)
         standard_rows, standard_seconds, _ = _predict_once(
-            profile, segments, estimate_hours, RaceCondition(), apply_environment=False
+            profile, segments, estimate_hours, RaceCondition(), route_pacing_match, apply_environment=False
         )
         updated_hours = standard_seconds / 3600.0
         if abs(updated_hours - estimate_hours) * 3600.0 <= float(duration_config["convergence_tolerance_seconds"]):
@@ -58,7 +60,13 @@ def predict_race(
             break
         estimate_hours = updated_hours
 
-    adjusted_rows, adjusted_seconds, breakdown = _predict_once(profile, segments, estimate_hours, race_condition)
+    route_pacing_match = match_route_pacing_strategy(profile, segments, estimate_hours)
+    standard_rows, standard_seconds, _ = _predict_once(
+        profile, segments, estimate_hours, RaceCondition(), route_pacing_match, apply_environment=False
+    )
+    adjusted_rows, adjusted_seconds, breakdown = _predict_once(
+        profile, segments, estimate_hours, race_condition, route_pacing_match
+    )
     aid_seconds = race_condition.aid_station_minutes * 60.0
     confidence_details = _prediction_confidence_details(profile, adjusted_rows, gpx_quality_score)
     confidence = float(confidence_details["overall"])
@@ -82,6 +90,7 @@ def predict_race(
         "confidence": round(confidence, 3),
         "duration_match": {"estimated_hours": round(estimate_hours, 3), "converged": converged,
                            "iterations": iteration, "terrain": {terrain: duration_match(profile, estimate_hours, terrain) for terrain in ("flat", "uphill", "downhill")}},
+        "pacing_strategy_match": route_pacing_match,
         "adjustment_breakdown": {**breakdown, "aid_station": round(aid_seconds, 1)},
         "probability": probability,
         "risk_notes": risks,
@@ -98,19 +107,23 @@ def predict_race(
 
 def _predict_once(
     profile: dict[str, object], segments: list[dict[str, float | str]], estimated_hours: float,
-    condition: RaceCondition, apply_environment: bool = True,
+    condition: RaceCondition, route_pacing_match: dict[str, object], apply_environment: bool = True,
 ) -> tuple[list[dict[str, object]], float, dict[str, float]]:
     elapsed = 0.0
     rows: list[dict[str, object]] = []
     totals = {"base_terrain": 0.0, "heart_rate_pacing": 0.0,
-              "duration_adaptation": 0.0, "fatigue": 0.0,
+              "pacing_strategy": 0.0, "fatigue": 0.0,
               "form": 0.0, "technical": 0.0, "mud": 0.0, "night": 0.0,
               "altitude": 0.0, "carried_weight": 0.0, "weather": 0.0,
               "temperature_fatigue": 0.0, "heart_rate_fatigue": 0.0}
+    total_distance = sum(max(0.0, float(item.get("distance", 0.0))) for item in segments)
+    completed_distance = 0.0
     for segment in segments:
         terrain = str(segment.get("type", "flat"))
         raw_seconds, basis = _base_segment_seconds(profile, segment)
-        match = duration_match(profile, estimated_hours, terrain)
+        segment_distance = max(0.0, float(segment.get("distance", 0.0)))
+        progress = (completed_distance + segment_distance / 2.0) / max(total_distance, 0.1)
+        match = pacing_factor(route_pacing_match, terrain, progress)
         sustainable_seconds = raw_seconds * float(match["factor"])
         fatigue = fatigue_factor(profile, elapsed / 3600.0, terrain)
         standard_seconds = sustainable_seconds / max(fatigue, 0.1)
@@ -181,13 +194,16 @@ def _predict_once(
             totals[name] += increase
             adjusted *= float(factor)
         elapsed += adjusted
+        completed_distance += segment_distance
         totals["base_terrain"] += raw_seconds
-        totals["duration_adaptation"] += sustainable_seconds - raw_seconds
+        totals["pacing_strategy"] += sustainable_seconds - raw_seconds
         totals["fatigue"] += standard_seconds - sustainable_seconds
         rows.append({**segment, "base_time_seconds": round(raw_seconds, 1),
                      "duration_factor": round(float(match["factor"]), 4),
                      "duration_confidence": float(match["confidence"]),
                      "duration_weights": match["weights"], "duration_source": match["source"],
+                     "pacing_strategy_factor": round(float(match["factor"]), 4),
+                     "pacing_strategy_progress": round(progress, 4),
                      "sustainable_time_seconds": round(sustainable_seconds, 1),
                      "fatigue_factor": round(fatigue, 3),
                      "standard_time_seconds": round(standard_seconds, 1),
@@ -397,12 +413,12 @@ def _fatigue_confidence_for_terrain(profile: dict[str, object], terrain: str) ->
 
 def _risk_notes(profile: dict[str, object], rows: list[dict[str, object]], gpx_quality: float, converged: bool) -> list[str]:
     notes: list[str] = []
-    if any(row.get("duration_source") == "fallback" for row in rows):
-        notes.append("目标时长附近的个人样本不足，持续能力使用了保守折减。")
+    if any(row.get("duration_source") == "duration_fallback" for row in rows):
+        notes.append("没有足够相似的历史距离与爬升样本，比赛配速策略已回退到时长能力层。")
     if gpx_quality < 0.7:
         notes.append("GPX 数据质量较低，预测区间已扩大。")
     if not converged:
-        notes.append("持续能力与预计时长迭代未完全收敛。")
+        notes.append("配速策略、疲劳与预计时长的迭代未完全收敛。")
     if float(profile.get("data_quality", {}).get("score", 1.0)) < 0.6:
         notes.append("历史 FIT 数据质量偏低。")
     altitude_profile = profile.get("environment", {}).get("altitude", {})

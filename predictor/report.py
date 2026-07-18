@@ -43,6 +43,27 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         "| 档位 | 平均坡度 | 等效配速 | VAM | 可信度 | 历史样本 | 累计距离 | 累计高度 |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
+    movement = profile.get("movement_detection", {})
+    movement_rows = []
+    for activity in profile.get("activities", []):
+        detail = activity.get("movement_detection", {})
+        movement_rows.append(
+            f"| {activity.get('name', '—')} | {format_duration(float(detail.get('moving_seconds', 0)))} | "
+            f"{format_duration(float(detail.get('recovered_zero_distance_seconds', 0)))} |"
+        )
+    if movement_rows:
+        insertion = lines.index("### 上坡能力")
+        lines[insertion:insertion] = [
+            "### FIT 移动时间识别",
+            "",
+            f"零距离量化时间共补回 {format_duration(float(movement.get('recovered_zero_distance_seconds', 0)))}。"
+            "仅补回短间隔，或有步频/功率证据且前后距离继续增长的区间；较长无运动信号区间按停留处理。",
+            "",
+            "| FIT | 识别移动时间 | 补回的零距离时间 |",
+            "| --- | ---: | ---: |",
+            *movement_rows,
+            "",
+        ]
     uphill_rows = (
         ("微坡", ">2%–5%", "1_percent"),
         ("缓坡", "5%–10%", "5_percent"),
@@ -104,6 +125,20 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         for point in fatigue.get(terrain, []):
             confidence = "—（固定基准）" if point.get("source") == "anchor" else f"{float(point.get('confidence', 0.2)):.0%}"
             lines.append(f"| {label} | {float(point['hour']):g}h | {float(point['factor']):.0%} | {confidence} |")
+    stages = profile.get("fatigue_stages", {})
+    base_sampling = profile.get("base_ability_sampling", {})
+    overall_stages = stages.get("overall", {})
+    lines.extend([
+        "",
+        "### 疲劳阶段与基础能力取样",
+        "",
+        f"- 新鲜阶段结束（97%能力保留）：{float(overall_stages.get('fresh_end_hour', 3)):.2f}h",
+        f"- 轻度疲劳结束（90%能力保留）：{float(overall_stages.get('mild_end_hour', 5)):.2f}h",
+        f"- 中度疲劳结束（80%能力保留）：{float(overall_stages.get('moderate_end_hour', 8)):.2f}h",
+        f"- 基础能力来源：{int(base_sampling.get('selected_activity_count', 0))} 条完整落在新鲜阶段的活动；"
+        "长距离活动继续用于比赛策略和疲劳，不按全程数据量主导基础能力。",
+        "",
+    ])
     temperature = profile.get("temperature", {})
     temperature_coverage = temperature.get("coverage", {})
     temperature_calibration = temperature.get("calibration", {})
@@ -264,26 +299,41 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         f"- 心率热应激最大附加系数：×{float(physiology.get('maximum_heart_rate_fatigue_factor', 1)):.3f}",
         f"- 预计终点HR漂移：{float(physiology.get('expected_hr_drift_at_finish_bpm', 0)):+.1f} bpm",
         "",
-        "### 目标时长能力匹配",
+        "### 历史比赛配速策略匹配",
         "",
         f"- 迭代预计时长：{float(prediction.get('duration_match', {}).get('estimated_hours', 0)):.2f} 小时",
         f"- 是否收敛：{'是' if prediction.get('duration_match', {}).get('converged', True) else '否'}",
-        "",
-        "| 地形 | 持续能力层权重 | 耗时系数 | 可信度 | 来源 |",
-        "| --- | --- | ---: | ---: | --- |",
         "## 分段预测",
         "",
-        "| 公里 | 地形 | 距离 | 平均坡度 | 强度 | 目标HR | 目标配速 | 心率配速 | 海拔 | 昼夜 | 爬升/下降 | 时长适配 | 疲劳因子 | 温度疲劳 | HR疲劳 | 海拔系数 | 条件系数 | 预测时间 |",
+        "| 公里 | 地形 | 距离 | 平均坡度 | 强度 | 目标HR | 目标配速 | 心率配速 | 海拔 | 昼夜 | 爬升/下降 | 路线配速策略 | 疲劳因子 | 温度疲劳 | HR疲劳 | 海拔系数 | 条件系数 | 预测时间 |",
         "| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
-    duration_terrain = prediction.get("duration_match", {}).get("terrain", {})
-    duration_rows = []
+    strategy_match = prediction.get("pacing_strategy_match", {})
+    target = strategy_match.get("target", {})
+    strategy_labels = {"negative_split": "负分割", "positive_split": "正分割", "even": "均匀", "variable": "波动", "duration_fallback": "时长层回退"}
+    strategy_source = "历史相似路线" if strategy_match.get("source") == "historical_route_strategy" else "旧时长能力层回退"
+    duration_rows = [
+        f"- 目标路线：{float(target.get('distance_km', 0)):.1f} km / +{float(target.get('elevation_gain_m', 0)):.0f} m，"
+        f"爬升密度 {float(target.get('climb_density_m_per_km', 0)):.0f} m/km",
+        f"- 匹配来源：{strategy_source}；策略类型：{strategy_labels.get(strategy_match.get('strategy_type'), strategy_match.get('strategy_type', '—'))}；"
+        f"可信度 {float(strategy_match.get('confidence', .2)):.0%}",
+        "",
+        "| 地形 | 前25% | 25%–50% | 50%–75% | 后25% |",
+        "| --- | ---: | ---: | ---: | ---: |",
+    ]
     for terrain in ("flat", "uphill", "downhill"):
-        match = duration_terrain.get(terrain, {})
-        weights = "、".join(f"{name} {float(weight):.0%}" for name, weight in match.get("weights", {}).items()) or "—"
-        duration_rows.append(f"| {terrain_labels[terrain]} | {weights} | ×{float(match.get('factor', 1)):.3f} | {float(match.get('confidence', .2)):.0%} | {match.get('source', 'legacy')} |")
+        curve = list(strategy_match.get("terrain_curves", {}).get(terrain, [1.0] * 4))
+        duration_rows.append(f"| {terrain_labels[terrain]} | " + " | ".join(f"×{float(value):.3f}" for value in curve) + " |")
+    matched = list(strategy_match.get("matched_activities", []))
+    if matched:
+        duration_rows += ["", "| 匹配 FIT | 距离 | 爬升 | 历史策略 | 相似度 | 权重 |", "| --- | ---: | ---: | --- | ---: | ---: |"]
+        duration_rows += [
+            f"| {item.get('activity', '—')} | {float(item.get('distance_km', 0)):.1f} km | +{float(item.get('elevation_gain_m', 0)):.0f} m | "
+            f"{strategy_labels.get(item.get('strategy_type'), item.get('strategy_type', '—'))} | {float(item.get('similarity', 0)):.0%} | {float(item.get('weight', 0)):.0%} |"
+            for item in matched
+        ]
     insertion = lines.index("## 分段预测")
     probability_uncertainty = prediction.get("probability", {}).get("uncertainty", {})
     confidence_details = probability_uncertainty.get("route_weighted_confidence", {})
@@ -341,7 +391,7 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
         "",
         "Monte Carlo 按分地形能力和疲劳曲线逐段重算，并分别采样温度直接影响、高温后程疲劳与心率热应激；同一场模拟内同类来源保持相关。",
         "",
-        "| 地形 | 预计耗时占比 | 能力可信度 | 疲劳可信度 | 持续能力可信度 |",
+        "| 地形 | 预计耗时占比 | 能力可信度 | 疲劳可信度 | 配速策略可信度 |",
         "| --- | ---: | ---: | ---: | ---: |",
     ] + probability_rows + uncertainty_details + ["### 时间损耗拆解", "", "| 项目 | 时间影响 |", "| --- | ---: |"] + [
         f"| {_breakdown_label(key)} | {format_duration(float(value))} |" for key, value in prediction.get("adjustment_breakdown", {}).items()
@@ -380,7 +430,7 @@ def build_markdown_report(profile: dict[str, object], prediction: dict[str, obje
 
 
 def _breakdown_label(key: str) -> str:
-    return {"base_terrain": "基础地形耗时", "heart_rate_pacing": "心率强度配速", "duration_adaptation": "目标时长适配", "fatigue": "疲劳增加",
+    return {"base_terrain": "基础地形耗时", "heart_rate_pacing": "心率强度配速", "duration_adaptation": "目标时长适配", "pacing_strategy": "比赛配速策略", "fatigue": "疲劳增加",
             "form": "当前状态", "technical": "技术难度", "mud": "泥泞", "night": "夜间",
             "altitude": "高海拔", "carried_weight": "装备负重", "weather": "温度/湿度直接影响",
             "temperature_fatigue": "高温后程疲劳", "heart_rate_fatigue": "心率热应激疲劳",

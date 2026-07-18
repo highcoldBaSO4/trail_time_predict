@@ -569,6 +569,41 @@ def render_result(result: dict[str, Any]) -> None:
                 columns=["项目", "结果"],
             )
             st.dataframe(route_data, hide_index=True, width="stretch")
+        strategy_match = prediction.get("pacing_strategy_match", {})
+        if strategy_match:
+            st.subheader("历史比赛配速策略匹配")
+            target = strategy_match.get("target", {})
+            strategy_labels = {"negative_split": "负分割", "positive_split": "正分割", "even": "均匀配速", "variable": "波动", "duration_fallback": "时长层回退"}
+            source_label = "历史相似路线" if strategy_match.get("source") == "historical_route_strategy" else "时长能力层回退"
+            st.caption(
+                f"目标 {float(target.get('distance_km', 0)):.1f} km / +{float(target.get('elevation_gain_m', 0)):.0f} m · "
+                f"爬升密度 {float(target.get('climb_density_m_per_km', 0)):.0f} m/km · "
+                f"{source_label} · {strategy_labels.get(strategy_match.get('strategy_type'), strategy_match.get('strategy_type', '—'))} · "
+                f"可信度 {float(strategy_match.get('confidence', .2)):.0%}"
+            )
+            terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
+            strategy_rows = []
+            for terrain in ("flat", "uphill", "downhill"):
+                curve = list(strategy_match.get("terrain_curves", {}).get(terrain, [1.0] * 4))
+                strategy_rows.append([terrain_labels[terrain], *[f"×{float(value):.3f}" for value in curve]])
+            st.dataframe(
+                pd.DataFrame(strategy_rows, columns=["地形", "前25%", "25%–50%", "50%–75%", "后25%"]),
+                hide_index=True,
+                width="stretch",
+            )
+            matched = list(strategy_match.get("matched_activities", []))
+            if matched:
+                st.dataframe(
+                    pd.DataFrame([
+                        [item.get("activity", "—"), f"{float(item.get('distance_km', 0)):.1f} km",
+                         f"+{float(item.get('elevation_gain_m', 0)):.0f} m",
+                         strategy_labels.get(item.get("strategy_type"), item.get("strategy_type", "—")),
+                         f"{float(item.get('similarity', 0)):.0%}", f"{float(item.get('weight', 0)):.0%}"]
+                        for item in matched
+                    ], columns=["匹配 FIT", "距离", "爬升", "历史策略", "相似度", "权重"]),
+                    hide_index=True,
+                    width="stretch",
+                )
         uncertainty = prediction["probability"].get("uncertainty", {})
         if uncertainty:
             st.subheader("概率区间依据")
@@ -590,7 +625,7 @@ def render_result(result: dict[str, Any]) -> None:
             st.dataframe(
                 pd.DataFrame(
                     uncertainty_rows,
-                    columns=["地形", "预计耗时占比", "能力可信度", "疲劳可信度", "持续能力可信度"],
+                    columns=["地形", "预计耗时占比", "能力可信度", "疲劳可信度", "配速策略可信度"],
                 ),
                 hide_index=True,
                 width="stretch",
@@ -627,7 +662,7 @@ def render_result(result: dict[str, Any]) -> None:
             )
         st.subheader("时间损耗拆解")
         labels = {"base_terrain": "基础地形", "heart_rate_pacing": "心率强度配速",
-                  "duration_adaptation": "目标时长适配", "fatigue": "疲劳",
+                  "duration_adaptation": "目标时长适配", "pacing_strategy": "比赛配速策略", "fatigue": "疲劳",
                   "form": "当前状态", "technical": "技术难度", "mud": "泥泞", "night": "夜间",
                   "altitude": "高海拔", "carried_weight": "负重", "weather": "温度/湿度直接影响",
                   "temperature_fatigue": "高温后程疲劳", "heart_rate_fatigue": "心率热应激疲劳",
@@ -684,6 +719,28 @@ def render_result(result: dict[str, Any]) -> None:
         st.dataframe(ability_table(profile, "uphill"), hide_index=True, width="stretch")
         st.subheader("下坡能力")
         st.dataframe(ability_table(profile, "downhill"), hide_index=True, width="stretch")
+        st.subheader("疲劳阶段与基础能力取样")
+        stages = profile.get("fatigue_stages", {})
+        base_sampling = profile.get("base_ability_sampling", {})
+        stage_rows = []
+        for terrain, label in (("flat", "平路"), ("uphill", "上坡"), ("downhill", "下坡")):
+            values = stages.get("terrain", {}).get(terrain, {})
+            stage_rows.append([
+                label,
+                f"{float(values.get('fresh_end_hour', 3)):.2f}h",
+                f"{float(values.get('mild_end_hour', 5)):.2f}h",
+                f"{float(values.get('moderate_end_hour', 8)):.2f}h",
+            ])
+        st.dataframe(
+            pd.DataFrame(stage_rows, columns=["地形", "97%保留", "90%保留", "80%保留"]),
+            hide_index=True,
+            width="stretch",
+        )
+        st.caption(
+            f"基础能力使用 {int(base_sampling.get('selected_activity_count', 0))} 条完整落在新鲜阶段的活动，"
+            f"统一新鲜边界为 {float(base_sampling.get('fresh_end_hour', 3)):.2f}h；"
+            "更长活动继续用于比赛策略和疲劳，不按全程数据量主导基础能力。"
+        )
         st.subheader("长时间疲劳衰减")
         fatigue = profile["fatigue"]
         fatigue_rows = []

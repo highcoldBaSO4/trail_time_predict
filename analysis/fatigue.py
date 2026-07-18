@@ -8,6 +8,8 @@ from config import load_config
 
 
 TERRAIN_METRICS = {"flat": "speed_mps", "uphill": "vam", "downhill": "speed_mps"}
+FATIGUE_STAGE_THRESHOLDS = (("fresh_end_hour", 0.97), ("mild_end_hour", 0.90), ("moderate_end_hour", 0.80))
+FATIGUE_STAGE_FALLBACK_HOURS = {"fresh_end_hour": 3.0, "mild_end_hour": 5.0, "moderate_end_hour": 8.0}
 
 
 def interpolate_fatigue(elapsed_hours: float, points: list[tuple[float, float]] | list[dict[str, float]]) -> float:
@@ -52,6 +54,54 @@ def build_fatigue_profile(activities: list[pd.DataFrame]) -> dict[str, object]:
     curves["5h"] = interpolate_fatigue(5.0, curves["flat"])
     curves["8h"] = interpolate_fatigue(8.0, curves["flat"])
     return curves
+
+
+def build_fatigue_stages(fatigue_profile: dict[str, object]) -> dict[str, object]:
+    """Convert continuous fatigue curves into explainable retention bands."""
+    terrain_stages: dict[str, dict[str, float]] = {}
+    for terrain in ("flat", "uphill", "downhill"):
+        curve = list(fatigue_profile.get(terrain, []))
+        terrain_stages[terrain] = {
+            name: round(_retention_crossing_hour(curve, retention, FATIGUE_STAGE_FALLBACK_HOURS[name]), 3)
+            for name, retention in FATIGUE_STAGE_THRESHOLDS
+        }
+    overall = {
+        name: round(min(terrain_stages[terrain][name] for terrain in terrain_stages), 3)
+        for name, _ in FATIGUE_STAGE_THRESHOLDS
+    }
+    return {
+        "thresholds": {name: retention for name, retention in FATIGUE_STAGE_THRESHOLDS},
+        "terrain": terrain_stages,
+        "overall": overall,
+        "method": "continuous_retention_crossings",
+    }
+
+
+def fatigue_stage_for_duration(duration_hours: float, stages: dict[str, object]) -> str:
+    overall = dict(stages.get("overall", {}))
+    duration = max(0.0, float(duration_hours))
+    if duration <= float(overall.get("fresh_end_hour", 3.0)):
+        return "fresh"
+    if duration <= float(overall.get("mild_end_hour", 5.0)):
+        return "mild"
+    if duration <= float(overall.get("moderate_end_hour", 8.0)):
+        return "moderate"
+    return "severe"
+
+
+def _retention_crossing_hour(curve: list[dict[str, object]], retention: float, fallback: float) -> float:
+    points = sorted((float(point["hour"]), float(point["factor"])) for point in curve)
+    if not points:
+        return fallback
+    for (left_hour, left_factor), (right_hour, right_factor) in zip(points, points[1:]):
+        if left_factor >= retention >= right_factor and left_factor != right_factor:
+            weight = (left_factor - retention) / (left_factor - right_factor)
+            return left_hour + weight * (right_hour - left_hour)
+        if left_factor == retention:
+            return left_hour
+    if points[-1][1] <= retention:
+        return points[-1][0]
+    return fallback
 
 
 def _terrain_samples(activity: pd.DataFrame, terrain: str) -> pd.DataFrame:

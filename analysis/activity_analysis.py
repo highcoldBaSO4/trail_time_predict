@@ -7,6 +7,8 @@ import pandas as pd
 MOVEMENT_WINDOW_SECONDS = 15
 MINIMUM_MOVEMENT_SPEED_MPS = 0.05
 MAXIMUM_MOVEMENT_SPEED_MPS = 12.0
+ZERO_DISTANCE_BRIDGE_SECONDS = 8.0
+ZERO_DISTANCE_SIGNAL_BRIDGE_SECONDS = 30.0
 
 
 def add_interval_metrics(frame: pd.DataFrame) -> pd.DataFrame:
@@ -62,12 +64,42 @@ def add_interval_metrics(frame: pd.DataFrame) -> pd.DataFrame:
     data["movement_grade_pct"] = np.nan
     data.loc[usable_timestamp, "movement_speed_mps"] = rolling_speed.to_numpy()
     data.loc[usable_timestamp, "movement_grade_pct"] = rolling_grade.clip(-60.0, 60.0).to_numpy()
+    rolling_movement = data["movement_speed_mps"].between(
+        MINIMUM_MOVEMENT_SPEED_MPS, MAXIMUM_MOVEMENT_SPEED_MPS
+    )
+    positive_distance = interval_valid & (data["dd_m"] > 0.0)
+    previous_update = timestamp.where(positive_distance).ffill()
+    next_update = timestamp.where(positive_distance).bfill()
+    bounded_gap_seconds = (next_update - previous_update).dt.total_seconds()
+    recorded_distance = pd.to_numeric(data["distance"], errors="coerce")
+    previous_distance = recorded_distance.where(positive_distance).ffill()
+    next_distance = recorded_distance.where(positive_distance).bfill()
+    bounded_gap_speed = (next_distance - previous_distance) / bounded_gap_seconds.replace(0.0, np.nan)
+    plausible_gap_speed = bounded_gap_speed.between(
+        MINIMUM_MOVEMENT_SPEED_MPS, MAXIMUM_MOVEMENT_SPEED_MPS
+    )
+    short_quantization_gap = (
+        bounded_gap_seconds.between(0.0, ZERO_DISTANCE_BRIDGE_SECONDS)
+        & (rolling_movement | plausible_gap_speed)
+    )
+
+    cadence = pd.to_numeric(data.get("cadence", pd.Series(np.nan, index=data.index)), errors="coerce")
+    power = pd.to_numeric(data.get("power", pd.Series(np.nan, index=data.index)), errors="coerce")
+    active_motion_signal = (cadence > 10.0) | (power > 5.0)
+    signalled_quantization_gap = (
+        active_motion_signal
+        & bounded_gap_seconds.between(0.0, ZERO_DISTANCE_SIGNAL_BRIDGE_SECONDS)
+        & plausible_gap_speed
+    )
+    recovered_zero_distance = (
+        (data["dd_m"].fillna(0.0) <= 0.0)
+        & (short_quantization_gap | signalled_quantization_gap)
+    )
     data["moving_interval"] = (
         interval_valid
-        & data["movement_speed_mps"].between(
-            MINIMUM_MOVEMENT_SPEED_MPS, MAXIMUM_MOVEMENT_SPEED_MPS
-        )
+        & ((positive_distance & rolling_movement) | recovered_zero_distance)
     )
+    data["recovered_zero_distance_interval"] = recovered_zero_distance & data["moving_interval"]
     data.attrs.update(source_attrs)
     return data
 

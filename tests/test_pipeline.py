@@ -12,14 +12,15 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from analysis.activity_analysis import analyze_activity
+from analysis.activity_analysis import add_interval_metrics, analyze_activity
 from analysis.activity_selection import apply_activity_review, build_activity_review
 from analysis.capability import build_runner_profile
 from analysis.confidence import calculate_confidence
 from analysis.data_quality import diagnose_fit, diagnose_gpx
 from analysis.downhill import interpolate_downhill_speed
 from analysis.environment import build_environment_profile, relative_altitude_factor, solar_elevation_degrees
-from analysis.fatigue import interpolate_fatigue
+from analysis.fatigue import build_fatigue_stages, interpolate_fatigue
+from analysis.pacing_strategy import build_pacing_strategy_profile
 from analysis.temperature import (
     calibrate_activity_temperature,
     humidity_time_factor,
@@ -33,6 +34,7 @@ from models import CapabilityValue, PredictionResult, RaceCondition, RunnerProfi
 from parser.gpx_reader import _terrain_type, build_race_segments, read_gpx, route_summary
 from parser import fit_reader
 from predictor.race_predictor import format_duration, predict_race
+from predictor.pacing_strategy import match_route_pacing_strategy, pacing_factor
 from predictor.report import build_markdown_report
 
 
@@ -52,6 +54,40 @@ def synthetic_activity(points: int = 120, seconds: int = 10) -> pd.DataFrame:
             "temperature": 20.0,
         }
     )
+
+
+def test_movement_detection_recovers_signalled_slow_quantized_progress() -> None:
+    points = 23
+    frame = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=points, freq="1s", tz="UTC"),
+        "distance": [0.0, 1.0, *([1.0] * 19), 2.0, 3.0],
+        "altitude": np.linspace(100.0, 102.0, points),
+        "cadence": 60.0,
+        "power": np.nan,
+    })
+
+    result = add_interval_metrics(frame)
+
+    middle = result.iloc[2:21]
+    assert middle["recovered_zero_distance_interval"].all()
+    assert middle["moving_interval"].all()
+
+
+def test_movement_detection_does_not_bridge_a_pause_without_motion_signal() -> None:
+    points = 16
+    frame = pd.DataFrame({
+        "timestamp": pd.date_range("2026-01-01", periods=points, freq="1s", tz="UTC"),
+        "distance": [0.0, 1.0, *([1.0] * 12), 2.0, 3.0],
+        "altitude": 100.0,
+        "cadence": 0.0,
+        "power": 0.0,
+    })
+
+    result = add_interval_metrics(frame)
+
+    pause = result.iloc[2:14]
+    assert not pause["recovered_zero_distance_interval"].any()
+    assert not pause["moving_interval"].any()
 
 
 def test_activity_metrics_and_profile() -> None:
@@ -161,6 +197,8 @@ def test_profile_and_report_expose_four_slope_bands() -> None:
     assert "能力保留比例" in report
     assert "耗时修正倍率" in report
     assert "疲劳因子" in report
+    assert "FIT 移动时间识别" in report
+    assert "补回的零距离时间" in report
 
 
 def test_gpx_segmentation_prediction_and_report() -> None:
@@ -603,6 +641,108 @@ def test_profile_exposes_duration_capability_layers() -> None:
     assert layers[0]["terrain_source"]["uphill"] == "personal"
     assert layers[-1]["source"] == "fallback"
     assert all("terrain_confidence" in layer for layer in layers)
+
+
+def test_fatigue_stages_use_continuous_retention_crossings() -> None:
+    stages = build_fatigue_stages(load_config()["default_profile"]["fatigue"])
+
+    assert stages["terrain"]["flat"]["fresh_end_hour"] == pytest.approx(3.6)
+    assert stages["terrain"]["flat"]["mild_end_hour"] == pytest.approx(5.0)
+    assert stages["terrain"]["flat"]["moderate_end_hour"] == pytest.approx(8.0)
+    assert stages["overall"]["moderate_end_hour"] == pytest.approx(6.5)
+
+
+def test_base_ability_uses_complete_fresh_activities_while_strategy_keeps_long_fit() -> None:
+    short = synthetic_activity(points=181, seconds=10)
+    long = synthetic_activity(points=901, seconds=20)
+
+    profile = build_runner_profile(
+        {"short.fit": short, "long.fit": long},
+        {"short.fit": "trail", "long.fit": "trail"},
+    )
+
+    sampling = profile["base_ability_sampling"]
+    assert sampling["selected_activities"] == ["short.fit"]
+    assert {sample["activity"] for sample in profile["pacing_strategy"]["samples"]} == {"short.fit", "long.fit"}
+    long_sample = next(sample for sample in profile["pacing_strategy"]["samples"] if sample["activity"] == "long.fit")
+    assert long_sample["fatigue_stage"] != "fresh"
+
+
+def test_pacing_strategy_detects_terrain_normalized_negative_split() -> None:
+    rows = pd.DataFrame([
+        {"activity": "negative.fit", "activity_type": "trail", "type": "flat", "distance_m": 1000.0,
+         "duration_s": seconds, "gain_m": 0.0, "loss_m": 0.0, "grade_pct": 0.0,
+         "model_weight": 1.0, "activity_elapsed_h": elapsed}
+        for seconds, elapsed in ((440.0, 0.0), (420.0, 0.12), (380.0, 0.24), (360.0, 0.35))
+    ])
+    fatigue = {terrain: [{"hour": 0.0, "factor": 1.0}, {"hour": 8.0, "factor": 1.0}]
+               for terrain in ("flat", "uphill", "downhill")}
+    strategy = build_pacing_strategy_profile(
+        rows,
+        {"aerobic_pace": 400.0},
+        {"curve": [{"grade": 10.0, "value": 500.0}]},
+        {"curve": [{"grade": -10.0, "speed_mps": 2.0}]},
+        fatigue,
+        1.0,
+    )
+
+    sample = strategy["samples"][0]
+    assert sample["strategy_type"] == "negative_split"
+    assert sample["overall_curve"][0] > sample["overall_curve"][-1]
+
+
+def test_pacing_strategy_does_not_treat_uphill_then_downhill_as_negative_split() -> None:
+    rows = pd.DataFrame([
+        {"activity": "terrain.fit", "activity_type": "trail", "type": terrain, "distance_m": 1000.0,
+         "duration_s": seconds, "gain_m": gain, "loss_m": loss, "grade_pct": grade,
+         "model_weight": 1.0, "activity_elapsed_h": index * 0.2}
+        for index, (terrain, seconds, gain, loss, grade) in enumerate((
+            ("uphill", 720.0, 100.0, 0.0, 10.0),
+            ("uphill", 720.0, 100.0, 0.0, 10.0),
+            ("downhill", 500.0, 0.0, 100.0, -10.0),
+            ("downhill", 500.0, 0.0, 100.0, -10.0),
+        ))
+    ])
+    fatigue = {terrain: [{"hour": 0.0, "factor": 1.0}, {"hour": 8.0, "factor": 1.0}]
+               for terrain in ("flat", "uphill", "downhill")}
+    strategy = build_pacing_strategy_profile(
+        rows,
+        {"aerobic_pace": 400.0},
+        {"curve": [{"grade": 10.0, "value": 500.0}]},
+        {"curve": [{"grade": -10.0, "speed_mps": 2.0}]},
+        fatigue,
+        1.0,
+    )
+
+    assert strategy["samples"][0]["strategy_type"] == "even"
+
+
+def test_target_route_matches_distance_and_ascent_strategy_instead_of_duration_only() -> None:
+    profile = build_runner_profile({"training.fit": synthetic_activity()})
+    profile["pacing_strategy"] = {
+        "phase_centers": [0.125, 0.375, 0.625, 0.875],
+        "samples": [
+            {"activity": "short.fit", "activity_type": "trail", "distance_km": 10.0,
+             "elevation_gain_m": 500.0, "climb_density_m_per_km": 50.0, "load_km": 15.0,
+             "terrain_share": {"flat": 1.0, "uphill": 0.0, "downhill": 0.0},
+             "overall_curve": [0.86] * 4, "terrain_curves": {terrain: [0.86] * 4 for terrain in ("flat", "uphill", "downhill")},
+             "strategy_type": "even", "confidence": 0.9, "model_weight": 1.0},
+            {"activity": "long.fit", "activity_type": "trail", "distance_km": 50.0,
+             "elevation_gain_m": 2500.0, "climb_density_m_per_km": 50.0, "load_km": 75.0,
+             "terrain_share": {"flat": 1.0, "uphill": 0.0, "downhill": 0.0},
+             "overall_curve": [1.16] * 4, "terrain_curves": {terrain: [1.16] * 4 for terrain in ("flat", "uphill", "downhill")},
+             "strategy_type": "even", "confidence": 0.9, "model_weight": 1.0},
+        ],
+    }
+    short_route = [{"distance": 10000.0, "gain": 500.0, "loss": 500.0, "type": "flat"}]
+    long_route = [{"distance": 50000.0, "gain": 2500.0, "loss": 2500.0, "type": "flat"}]
+
+    short_match = match_route_pacing_strategy(profile, short_route, 2.0)
+    long_match = match_route_pacing_strategy(profile, long_route, 8.0)
+
+    assert short_match["matched_activities"][0]["activity"] == "short.fit"
+    assert long_match["matched_activities"][0]["activity"] == "long.fit"
+    assert pacing_factor(short_match, "flat", 0.5)["factor"] < pacing_factor(long_match, "flat", 0.5)["factor"]
 
 
 def test_phase2_prediction_conditions_and_probability_order() -> None:

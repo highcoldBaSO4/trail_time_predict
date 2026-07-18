@@ -8,12 +8,18 @@ from typing import Callable
 import numpy as np
 import pandas as pd
 
-from analysis.activity_analysis import add_interval_metrics, analyze_activity
+from analysis.activity_analysis import (
+    ZERO_DISTANCE_BRIDGE_SECONDS,
+    ZERO_DISTANCE_SIGNAL_BRIDGE_SECONDS,
+    add_interval_metrics,
+    analyze_activity,
+)
 from analysis.activity_selection import infer_activity_type
 from analysis.confidence import aggregate_quality_score, calculate_confidence
 from analysis.data_quality import diagnose_fit
-from analysis.fatigue import build_fatigue_profile
+from analysis.fatigue import build_fatigue_profile, build_fatigue_stages
 from analysis.heart_rate import build_heart_rate_profile
+from analysis.pacing_strategy import build_pacing_strategy_profile
 from analysis.environment import build_environment_profile
 from analysis.temperature import calibrate_activity_temperature, build_temperature_profile
 from analysis.weather import enrich_activity_with_historical_weather
@@ -43,6 +49,7 @@ def build_runner_profile(
     terrain_segments: list[dict[str, float | str]] = []
     activity_types: dict[str, str] = {}
     quality_reports: dict[str, dict[str, object]] = {}
+    movement_diagnostics: dict[str, dict[str, float]] = {}
     for name, frame in activities.items():
         activity_type = (activity_type_overrides or {}).get(name, infer_activity_type(name, frame))
         if activity_type not in {"trail", "road"}:
@@ -53,22 +60,46 @@ def build_runner_profile(
         activity = enrich_activity_with_historical_weather(activity, name, progress)
         activity["_activity_name"] = name
         activity["_activity_type"] = activity_type
-        activity["_model_weight"] = _activity_weight(name, activity, activity_type)
+        activity["_model_weight"] = (
+            _activity_weight(name, activity, activity_type)
+            * float(quality_reports[name].get("score", 0.2))
+        )
         moving = activity["moving_interval"].fillna(False)
         activity["_activity_duration_h"] = float(
             activity.loc[moving, "dt_seconds"].fillna(0).clip(lower=0).sum()
         ) / 3600.0
+        recovered = activity.get("recovered_zero_distance_interval", pd.Series(False, index=activity.index)).fillna(False)
+        movement_diagnostics[name] = {
+            "moving_seconds": round(float(activity.loc[moving, "dt_seconds"].fillna(0).clip(lower=0).sum()), 1),
+            "recovered_zero_distance_seconds": round(
+                float(activity.loc[recovered, "dt_seconds"].fillna(0).clip(lower=0).sum()), 1
+            ),
+        }
         enriched.append(activity)
         terrain_segments.extend(_activity_terrain_segments(activity, name, activity_type))
     segment_frame = pd.DataFrame(terrain_segments)
     quality_score = aggregate_quality_score(list(quality_reports.values()))
-    flat = _build_flat_profile(segment_frame, quality_score)
-    uphill = {**DEFAULT_PROFILE["uphill"], **_build_uphill_profile(segment_frame)}
-    downhill = {**DEFAULT_PROFILE["downhill"], **_build_downhill_profile(segment_frame)}
+    fatigue_profile = build_fatigue_profile(enriched)
+    fatigue_stages = build_fatigue_stages(fatigue_profile)
+    fresh_end_hour = float(fatigue_stages["overall"]["fresh_end_hour"])
+    fresh_activity_names = {
+        str(name)
+        for name, duration in segment_frame.groupby("activity")["activity_duration_h"].first().items()
+        if float(duration) <= fresh_end_hour
+    } if not segment_frame.empty else set()
+    base_segments = segment_frame[segment_frame["activity"].isin(fresh_activity_names)] if fresh_activity_names else segment_frame
+    base_source = "fresh_activities" if fresh_activity_names else "long_activity_opening_fallback"
+    if not fresh_activity_names and not segment_frame.empty:
+        base_segments = segment_frame[segment_frame["activity_elapsed_h"] <= fresh_end_hour]
+    flat = _build_flat_profile(base_segments, quality_score)
+    uphill = {**DEFAULT_PROFILE["uphill"], **_build_uphill_profile(base_segments)}
+    downhill = {**DEFAULT_PROFILE["downhill"], **_build_downhill_profile(base_segments)}
     uphill["curve"] = _uphill_curve(uphill, quality_score)
     downhill["curve"] = _downhill_curve(downhill, quality_score)
     duration_capabilities = _build_duration_capabilities(segment_frame, flat, uphill, downhill, quality_score)
-    fatigue_profile = build_fatigue_profile(enriched)
+    pacing_strategy_profile = build_pacing_strategy_profile(
+        segment_frame, flat, uphill, downhill, fatigue_profile, quality_score
+    )
     heart_rate_profile = build_heart_rate_profile(enriched, segment_frame)
     temperature_profile = build_temperature_profile(enriched, fatigue_profile)
     activity_summaries = []
@@ -76,6 +107,7 @@ def build_runner_profile(
         summary = analyze_activity(frame, name)
         summary["activity_type"] = activity_types[name]
         summary["data_quality"] = quality_reports[name]
+        summary["movement_detection"] = movement_diagnostics[name]
         activity_summaries.append(summary)
     profile: dict[str, object] = {
         "schema_version": "0.3",
@@ -91,11 +123,29 @@ def build_runner_profile(
         "uphill": uphill,
         "downhill": downhill,
         "fatigue": fatigue_profile,
+        "fatigue_stages": fatigue_stages,
+        "base_ability_sampling": {
+            "source": base_source,
+            "fresh_end_hour": round(fresh_end_hour, 3),
+            "selected_activities": sorted(fresh_activity_names),
+            "selected_activity_count": len(fresh_activity_names),
+            "method": "per_activity_weighted_fresh_stage",
+        },
         "temperature": temperature_profile,
         "heart_rate": heart_rate_profile,
         "environment": build_environment_profile(enriched),
         "duration_capabilities": duration_capabilities,
+        "pacing_strategy": pacing_strategy_profile,
         "activities": activity_summaries,
+        "movement_detection": {
+            "method": "bounded_zero_distance_bridge_with_cadence_or_power",
+            "short_bridge_seconds": ZERO_DISTANCE_BRIDGE_SECONDS,
+            "signal_bridge_seconds": ZERO_DISTANCE_SIGNAL_BRIDGE_SECONDS,
+            "recovered_zero_distance_seconds": round(
+                sum(item["recovered_zero_distance_seconds"] for item in movement_diagnostics.values()), 1
+            ),
+            "activities": movement_diagnostics,
+        },
         "terrain_segments": {
             "total": len(terrain_segments),
             "uphill": sum(item["type"] == "uphill" for item in terrain_segments),
@@ -299,7 +349,7 @@ def _build_uphill_profile(segments: pd.DataFrame) -> dict[str, object]:
         seconds = float(sample["duration_s"].sum()) if not sample.empty else 0.0
         samples[label] = _slope_sample_summary(sample, "gain_m")
         if seconds > 0:
-            result[label] = round(float(sample["gain_m"].sum()) / seconds * 3600.0, 1)
+            result[label] = round(_per_activity_weighted_rate(sample, "gain_m", 3600.0), 1)
     result["_samples"] = samples
     return result
 
@@ -329,8 +379,8 @@ def _build_downhill_profile(segments: pd.DataFrame) -> dict[str, object]:
         samples[label] = _slope_sample_summary(sample, "loss_m")
         if seconds > 0:
             result[label] = {
-                "speed_mps": round(float(sample["distance_m"].sum()) / seconds, 3),
-                "vertical_speed_mph": round(float(sample["loss_m"].sum()) / seconds * 3600.0, 1),
+                "speed_mps": round(_per_activity_weighted_rate(sample, "distance_m", 1.0), 3),
+                "vertical_speed_mph": round(_per_activity_weighted_rate(sample, "loss_m", 3600.0), 1),
             }
     result["_samples"] = samples
     return result
@@ -344,12 +394,36 @@ def _weighted_percentile(frame: pd.DataFrame, column: str, percentile: float) ->
     if frame.empty:
         return np.nan
     values = frame[column].to_numpy(dtype=float)
-    weights = frame.get("model_weight", pd.Series(1.0, index=frame.index)).to_numpy(dtype=float)
+    weights = frame.get("model_weight", pd.Series(1.0, index=frame.index)).astype(float)
+    if "activity" in frame:
+        activity_segments = frame.groupby("activity")["activity"].transform("size").clip(lower=1)
+        weights = weights / activity_segments
+    weights = weights.to_numpy(dtype=float)
     order = np.argsort(values)
     values, weights = values[order], weights[order]
     target = np.clip(percentile / 100.0, 0.0, 1.0) * weights.sum()
     index = min(int(np.searchsorted(np.cumsum(weights), target, side="left")), len(values) - 1)
     return float(values[index])
+
+
+def _per_activity_weighted_rate(frame: pd.DataFrame, numerator: str, scale: float) -> float:
+    """Give each activity one terrain-band estimate instead of volume dominance."""
+    values: list[float] = []
+    weights: list[float] = []
+    for _, activity in frame.groupby("activity", sort=False):
+        seconds = float(activity["duration_s"].sum())
+        if seconds <= 0:
+            continue
+        value = float(activity[numerator].sum()) / seconds * scale
+        if not np.isfinite(value) or value <= 0:
+            continue
+        model_weight = float(activity.get("model_weight", pd.Series(1.0, index=activity.index)).median())
+        evidence = min(1.0, seconds / 1800.0)
+        values.append(value)
+        weights.append(max(0.01, model_weight * (0.35 + 0.65 * evidence)))
+    if not values:
+        return np.nan
+    return float(np.average(np.asarray(values), weights=np.asarray(weights)))
 
 
 def _activity_weight(name: str, frame: pd.DataFrame, activity_type: str) -> float:
@@ -381,6 +455,7 @@ def _flat_source_summary(segments: pd.DataFrame) -> dict[str, float | int | None
 def _slope_sample_summary(segments: pd.DataFrame, vertical_column: str) -> dict[str, float | int]:
     return {
         "segments": len(segments),
+        "activities": int(segments["activity"].nunique()) if not segments.empty and "activity" in segments else 0,
         "distance_km": round(float(segments["distance_m"].sum()) / 1000.0, 3) if not segments.empty else 0.0,
         "vertical_m": round(float(segments[vertical_column].sum()), 1) if not segments.empty else 0.0,
         "duration_hour": round(float(segments["duration_s"].sum()) / 3600.0, 3) if not segments.empty else 0.0,
