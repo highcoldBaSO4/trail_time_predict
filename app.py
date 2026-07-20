@@ -13,6 +13,19 @@ import pandas as pd
 import streamlit as st
 
 from analysis.capability import build_runner_profile
+from analysis.ability_file import (
+    ABILITY_FILE_EXTENSION,
+    ABILITY_FILE_MIME,
+    AbilityBundle,
+    ability_bundle_summary,
+    activity_hashes_from_uploads,
+    build_ability_bundle,
+    load_ability_bundle,
+    profile_before_activity,
+    refresh_ability_bundle,
+    serialize_ability_bundle,
+    update_ability_bundle,
+)
 from analysis.performance import analyze_performance
 from analysis.activity_selection import ACTIVITY_TYPE_LABELS, LABEL_TO_ACTIVITY_TYPE, apply_activity_review, build_activity_review
 from analysis.data_quality import diagnose_gpx
@@ -100,7 +113,7 @@ def inject_styles() -> None:
             letter-spacing: .04em; margin: 0 0 .4rem .1rem;
         }
         [data-testid="stSidebar"] div[role="radiogroup"] {
-            display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: .25rem;
+            display: grid; grid-template-columns: minmax(0, 1fr); gap: .25rem;
             padding: .25rem; border: 1px solid #e4e9ee; border-radius: 10px;
             background: #f1f4f6;
         }
@@ -230,22 +243,26 @@ def calculate_prediction(
     aid_minutes: float,
     condition: RaceCondition | None = None,
     simulations: int = 3000,
+    profile: dict[str, object] | None = None,
 ) -> dict[str, Any]:
     total_steps = 4
     completed = 0
     progress = st.progress(0, text="准备建立能力画像……")
     with st.status("正在建立个人能力画像", expanded=True) as status:
-        status.write(f"使用已确认的 {len(activities)} 个活动识别自然爬坡、下降和平路……")
-        try:
-            profile = build_runner_profile(
-                activities,
-                activity_types,
-                progress=lambda message: status.write(message.strip()),
-            )
-        except ValueError:
-            raise
-        except Exception as exc:
-            raise AnalysisStageError("个人能力画像生成", exc) from exc
+        if profile is None:
+            status.write(f"使用已确认的 {len(activities)} 个活动识别自然爬坡、下降和平路……")
+            try:
+                profile = build_runner_profile(
+                    activities,
+                    activity_types,
+                    progress=lambda message: status.write(message.strip()),
+                )
+            except ValueError:
+                raise
+            except Exception as exc:
+                raise AnalysisStageError("个人能力画像生成", exc) from exc
+        else:
+            status.write("使用已加载的个人能力文件……")
         completed += 1
         progress.progress(completed / total_steps, text="个人能力画像已生成")
 
@@ -1083,48 +1100,254 @@ def render_performance_result(result: dict[str, Any]) -> None:
             )
 
 
+def render_ability_summary(bundle: AbilityBundle, key_prefix: str) -> None:
+    summary = ability_bundle_summary(bundle)
+    columns = st.columns(4)
+    columns[0].metric("有效活动", int(summary["activity_count"]))
+    columns[1].metric("平路可信度", f"{float(summary['flat_confidence']):.0%}")
+    latest = summary.get("latest_activity")
+    columns[2].metric("最近活动", str(latest)[:10] if latest else "旧版未知")
+    columns[3].metric("文件能力", "可增量更新" if summary["supports_update"] else "旧版只读")
+    if bundle.legacy:
+        st.warning("这是旧版 runner_profile.json：可用于预测，但缺少逐活动证据，不能可靠增量更新或重建历史诊断快照。")
+    else:
+        reference = str(summary.get("reference_time") or "")[:10]
+        earliest = str(summary.get("earliest_activity") or "")[:10]
+        st.caption(f"活动日期范围：{earliest or '未知'} 至 {str(latest)[:10] if latest else '未知'}；能力参考日期：{reference or '未知'}。")
+    profile = bundle.profile
+    uphill, downhill = st.columns(2)
+    with uphill:
+        st.markdown("#### 上坡能力")
+        st.dataframe(ability_table(profile, "uphill"), hide_index=True, width="stretch")
+    with downhill:
+        st.markdown("#### 下坡能力")
+        st.dataframe(ability_table(profile, "downhill"), hide_index=True, width="stretch")
+
+
+def render_ability_download(bundle: AbilityBundle, key: str, label: str = "下载个人能力文件") -> None:
+    if not bundle.supports_update:
+        return
+    st.download_button(
+        label,
+        serialize_ability_bundle(bundle),
+        f"trail_ability.{ABILITY_FILE_EXTENSION}",
+        ABILITY_FILE_MIME,
+        key=key,
+        width="stretch",
+    )
+
+
+def render_ability_workflow() -> None:
+    with st.sidebar:
+        st.markdown('<div class="sidebar-title">个人能力工作流</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="sidebar-copy">创建可复用的个人能力文件，或用新增 FIT 更新已有文件。</div>',
+            unsafe_allow_html=True,
+        )
+        st.info("隐私提示：能力文件包含重新建模所需的标准化活动时间、轨迹和生理数据，请像原始 FIT 一样妥善保管。")
+        operation = st.radio(
+            "操作方式",
+            options=["新建个人能力", "更新个人能力"],
+            key="ability_operation",
+        )
+        if st.session_state.get("ability_operation_previous") != operation:
+            st.session_state["ability_operation_previous"] = operation
+            st.session_state.pop("ability_result_bundle", None)
+        existing_file = None
+        if operation == "更新个人能力":
+            step_heading(1, "上传已有能力文件")
+            existing_file = st.file_uploader(
+                "选择 .ttp-profile 或旧版 .json 文件",
+                key="ability_existing_file",
+                help="文件格式由系统读取后校验，支持新版 .ttp-profile 和旧版 runner_profile.json。",
+            )
+        step_heading(2 if existing_file is not None else 1, "上传新增 Activity FIT")
+        fit_files = st.file_uploader(
+            "选择一个或多个 .fit 文件",
+            type=["fit"],
+            accept_multiple_files=True,
+            key="ability_fit_files",
+        )
+        if fit_files:
+            signature = upload_signature(fit_files)
+            if st.session_state.get("ability_fit_signature") != signature:
+                st.session_state["ability_fit_signature"] = signature
+                for key in ("ability_activities", "ability_review_rows", "ability_review_signature", "ability_result_bundle"):
+                    st.session_state.pop(key, None)
+            if st.button("解析并确认新增活动", width="stretch", key="ability_parse"):
+                try:
+                    parsed, rows = parse_activity_uploads(fit_files)
+                    st.session_state["ability_activities"] = parsed
+                    st.session_state["ability_review_rows"] = rows
+                except ValueError as exc:
+                    st.warning(str(exc))
+                except Exception:
+                    logger.exception("ability FIT parsing failed")
+                    st.error("个人能力活动解析失败，请检查上传文件后重试。")
+
+    st.markdown("# 个人能力")
+    st.markdown(
+        '<div class="app-subtitle">持续积累历史 FIT，生成带日期权重、可下载和可增量更新的个人能力文件。</div>',
+        unsafe_allow_html=True,
+    )
+    existing_bundle: AbilityBundle | None = None
+    if existing_file is not None:
+        try:
+            existing_bundle = load_ability_bundle(existing_file)
+            st.markdown("### 当前能力文件")
+            render_ability_summary(existing_bundle, "ability_existing")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    activities: dict[str, pd.DataFrame] = st.session_state.get("ability_activities", {})
+    review_rows: list[dict[str, Any]] = st.session_state.get("ability_review_rows", [])
+    selected: dict[str, pd.DataFrame] = {}
+    selected_types: dict[str, str] = {}
+    if activities and review_rows:
+        with st.expander("新增活动确认与筛选", expanded=True):
+            normalized = render_activity_review(
+                review_rows,
+                f"ability_review_{st.session_state.get('ability_fit_signature', 'none')}",
+            )
+        signature = tuple((row["filename"], bool(row["use_for_model"]), row["confirmed_type"]) for row in normalized)
+        if st.session_state.get("ability_review_signature") != signature:
+            st.session_state["ability_review_signature"] = signature
+            st.session_state.pop("ability_result_bundle", None)
+        try:
+            selected, selected_types = apply_activity_review(activities, normalized)
+        except ValueError as exc:
+            st.warning(str(exc))
+
+    can_generate = bool(selected) and (operation == "新建个人能力" or (existing_bundle and existing_bundle.supports_update))
+    if st.button("生成个人能力文件" if operation == "新建个人能力" else "更新个人能力文件",
+                 type="primary", disabled=not can_generate, key="ability_generate"):
+        try:
+            hashes = activity_hashes_from_uploads(fit_files)
+            hashes = {name: hashes[name] for name in selected}
+            with st.status("正在生成个人能力文件", expanded=True) as status:
+                if operation == "新建个人能力":
+                    bundle = build_ability_bundle(
+                        selected,
+                        selected_types,
+                        hashes,
+                        progress=lambda message: status.write(message.strip()),
+                    )
+                    skipped: list[str] = []
+                else:
+                    bundle, skipped = update_ability_bundle(
+                        existing_bundle,
+                        selected,
+                        selected_types,
+                        hashes,
+                        progress=lambda message: status.write(message.strip()),
+                    )
+                st.session_state["ability_result_bundle"] = bundle
+                status.update(label="个人能力文件生成完成", state="complete", expanded=False)
+            if skipped:
+                st.info("以下重复 FIT 已跳过：" + "、".join(skipped))
+        except ValueError as exc:
+            st.warning(str(exc))
+        except Exception as exc:
+            logger.exception("ability file generation failed")
+            st.error(f"个人能力文件生成失败：{exc}")
+
+    result_bundle: AbilityBundle | None = st.session_state.get("ability_result_bundle")
+    if result_bundle is not None:
+        st.markdown("### 生成结果")
+        render_ability_summary(result_bundle, "ability_result")
+        render_ability_download(result_bundle, "ability_download")
+    elif not activities and existing_bundle is None:
+        st.markdown(
+            """
+            <div class="empty-state">
+                <div class="empty-mark">⌁</div>
+                <div class="empty-title">建立可持续更新的个人能力档案</div>
+                <div class="empty-copy">上传历史 FIT 新建能力文件，或上传已有能力文件并加入最新活动。</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def render_performance_workflow() -> None:
     with st.sidebar:
         st.markdown('<div class="sidebar-title">活动表现诊断工作流</div>', unsafe_allow_html=True)
         st.markdown(
-            '<div class="sidebar-copy">历史基准 FIT 用于建立能力画像；待诊断 FIT 只参与表现对比，两者不会混用。</div>',
+            '<div class="sidebar-copy">使用个人能力文件，或在本页通过历史基准 FIT 生成能力后再诊断。</div>',
             unsafe_allow_html=True,
         )
-        step_heading(1, "上传历史基准 FIT")
-        baseline_files = st.file_uploader(
-            "选择多个历史 .fit 文件",
-            type=["fit"],
-            accept_multiple_files=True,
-            key="diagnosis_baseline_files",
-            help="不要包含下面要诊断的目标活动。建议包含多条越野、路跑和长距离记录。",
+        diagnosis_source = st.radio(
+            "能力来源",
+            options=["个人能力文件", "历史基准 FIT"],
+            key="diagnosis_ability_source",
         )
-        if baseline_files:
-            baseline_signature = upload_signature(baseline_files)
-            if st.session_state.get("diagnosis_baseline_signature") != baseline_signature:
-                st.session_state["diagnosis_baseline_signature"] = baseline_signature
-                for key in ("diagnosis_baseline_activities", "diagnosis_review_rows", "diagnosis_review_signature", "diagnosis_result"):
-                    st.session_state.pop(key, None)
-            if st.button("解析并确认基准活动", width="stretch", key="diagnosis_parse_baseline"):
-                try:
-                    parsed, rows = parse_activity_uploads(baseline_files)
-                    st.session_state["diagnosis_baseline_activities"] = parsed
-                    st.session_state["diagnosis_review_rows"] = rows
-                except ValueError as exc:
-                    st.warning(str(exc))
-                except Exception:
-                    logger.exception("diagnosis baseline parsing failed")
-                    st.error("基准活动解析过程中出现异常，请检查文件后重试。")
+        if st.session_state.get("diagnosis_source_previous") != diagnosis_source:
+            st.session_state["diagnosis_source_previous"] = diagnosis_source
+            st.session_state.pop("diagnosis_result", None)
+        baseline_files: list[Any] = []
+        if diagnosis_source == "个人能力文件":
+            step_heading(1, "上传个人能力文件")
+            diagnosis_ability_file = st.file_uploader(
+                "选择 .ttp-profile 或旧版 .json",
+                key="diagnosis_ability_file",
+                help="文件格式由系统读取后校验。",
+            )
+            if diagnosis_ability_file is not None:
+                signature = upload_signature([diagnosis_ability_file])
+                if st.session_state.get("diagnosis_ability_signature") != signature:
+                    st.session_state["diagnosis_ability_signature"] = signature
+                    st.session_state.pop("diagnosis_result", None)
+                    try:
+                        st.session_state["diagnosis_ability_bundle"] = load_ability_bundle(diagnosis_ability_file)
+                    except ValueError as exc:
+                        st.session_state.pop("diagnosis_ability_bundle", None)
+                        st.warning(str(exc))
+            else:
+                st.session_state.pop("diagnosis_ability_bundle", None)
         else:
-            for key in ("diagnosis_baseline_signature", "diagnosis_baseline_activities", "diagnosis_review_rows", "diagnosis_review_signature", "diagnosis_result"):
-                st.session_state.pop(key, None)
+            step_heading(1, "上传历史基准 FIT")
+            baseline_files = st.file_uploader(
+                "选择多个历史 .fit 文件",
+                type=["fit"],
+                accept_multiple_files=True,
+                key="diagnosis_baseline_files",
+                help="不要包含下面要诊断的目标活动。建议包含多条越野、路跑和长距离记录。",
+            )
+            if baseline_files:
+                baseline_signature = upload_signature(baseline_files)
+                if st.session_state.get("diagnosis_baseline_signature") != baseline_signature:
+                    st.session_state["diagnosis_baseline_signature"] = baseline_signature
+                    for key in ("diagnosis_baseline_activities", "diagnosis_review_rows", "diagnosis_review_signature",
+                                "diagnosis_generated_bundle", "diagnosis_result"):
+                        st.session_state.pop(key, None)
+                if st.button("解析并确认基准活动", width="stretch", key="diagnosis_parse_baseline"):
+                    try:
+                        parsed, rows = parse_activity_uploads(baseline_files)
+                        st.session_state["diagnosis_baseline_activities"] = parsed
+                        st.session_state["diagnosis_review_rows"] = rows
+                    except ValueError as exc:
+                        st.warning(str(exc))
+                    except Exception:
+                        logger.exception("diagnosis baseline parsing failed")
+                        st.error("基准活动解析过程中出现异常，请检查文件后重试。")
+            else:
+                for key in ("diagnosis_baseline_signature", "diagnosis_baseline_activities", "diagnosis_review_rows",
+                            "diagnosis_review_signature", "diagnosis_generated_bundle"):
+                    st.session_state.pop(key, None)
 
     st.markdown("# 越野跑活动表现诊断")
     st.markdown(
         '<div class="app-subtitle">使用独立历史能力画像，判断一条已完成活动是否符合预期，并比较分地形与前后半程表现。</div>',
         unsafe_allow_html=True,
     )
-    baseline_activities: dict[str, pd.DataFrame] = st.session_state.get("diagnosis_baseline_activities", {})
-    review_rows: list[dict[str, Any]] = st.session_state.get("diagnosis_review_rows", [])
+    baseline_activities: dict[str, pd.DataFrame] = (
+        st.session_state.get("diagnosis_baseline_activities", {})
+        if diagnosis_source == "历史基准 FIT" else {}
+    )
+    review_rows: list[dict[str, Any]] = (
+        st.session_state.get("diagnosis_review_rows", [])
+        if diagnosis_source == "历史基准 FIT" else []
+    )
     selected_baseline: dict[str, pd.DataFrame] = {}
     baseline_types: dict[str, str] = {}
     if baseline_activities and review_rows:
@@ -1137,10 +1360,42 @@ def render_performance_workflow() -> None:
         if st.session_state.get("diagnosis_review_signature") != signature:
             st.session_state["diagnosis_review_signature"] = signature
             st.session_state.pop("diagnosis_result", None)
+            st.session_state.pop("diagnosis_generated_bundle", None)
         try:
             selected_baseline, baseline_types = apply_activity_review(baseline_activities, normalized)
         except ValueError as exc:
             st.warning(str(exc))
+
+    diagnosis_bundle: AbilityBundle | None = (
+        st.session_state.get("diagnosis_ability_bundle")
+        if diagnosis_source == "个人能力文件"
+        else st.session_state.get("diagnosis_generated_bundle")
+    )
+    if diagnosis_source == "历史基准 FIT" and selected_baseline:
+        if st.button("生成基准能力文件并继续", type="primary", key="diagnosis_build_ability"):
+            try:
+                hashes = activity_hashes_from_uploads(baseline_files)
+                hashes = {name: hashes[name] for name in selected_baseline}
+                with st.status("正在生成诊断基准能力文件", expanded=True) as status:
+                    diagnosis_bundle = build_ability_bundle(
+                        selected_baseline,
+                        baseline_types,
+                        hashes,
+                        progress=lambda message: status.write(message.strip()),
+                    )
+                    st.session_state["diagnosis_generated_bundle"] = diagnosis_bundle
+                    status.update(label="诊断基准能力文件已生成", state="complete", expanded=False)
+            except ValueError as exc:
+                st.warning(str(exc))
+            except Exception as exc:
+                logger.exception("diagnosis ability generation failed")
+                st.error(f"诊断基准能力文件生成失败：{exc}")
+
+    if diagnosis_bundle is not None:
+        with st.expander("本次使用的基准能力", expanded=False):
+            render_ability_summary(diagnosis_bundle, "diagnosis_bundle")
+        if diagnosis_source == "历史基准 FIT":
+            render_ability_download(diagnosis_bundle, "diagnosis_ability_download", "下载本次生成的基准能力文件")
 
     with st.sidebar:
         step_heading(2, "上传待诊断活动 FIT")
@@ -1171,18 +1426,11 @@ def render_performance_workflow() -> None:
             key="diagnosis_simulations",
         )
         step_heading(4, "开始诊断")
-        can_analyze = bool(selected_baseline and target_file)
+        can_analyze = bool(diagnosis_bundle is not None and target_file)
         if st.button("开始活动表现诊断", type="primary", disabled=not can_analyze, width="stretch", key="diagnosis_run"):
             try:
                 validate_uploads([*baseline_files, target_file])
                 target_hash = hashlib.sha256(target_file.getvalue()).hexdigest()
-                baseline_hashes = {
-                    hashlib.sha256(item.getvalue()).hexdigest()
-                    for item in baseline_files
-                    if item.name in selected_baseline
-                }
-                if target_hash in baseline_hashes:
-                    raise ValueError("待诊断 FIT 同时出现在历史基准中，请从基准活动里移除该文件，避免数据泄漏。")
                 with st.status("正在进行活动表现诊断", expanded=True) as status:
                     status.write("解析待诊断 FIT 并匹配历史天气……")
                     parsed_target = read_fit(target_file, progress=lambda message: status.write(message.strip()))
@@ -1192,15 +1440,29 @@ def render_performance_workflow() -> None:
                         target_file.name,
                         progress=lambda message: status.write(message.strip()),
                     )
+                    snapshot_profile, excluded_activities = profile_before_activity(
+                        diagnosis_bundle,
+                        parsed_target,
+                        target_hash=target_hash,
+                        progress=lambda message: status.write(message.strip()),
+                    )
                     analyzed = analyze_performance(
-                        selected_baseline,
-                        baseline_types,
+                        {},
+                        {},
                         parsed_target,
                         target_file.name,
                         sample_distance_m=float(sample_distance),
                         simulations=int(simulations),
                         progress=lambda message: status.write(message.strip()),
+                        profile=snapshot_profile,
                     )
+                    analyzed["ability_context"] = {
+                        "source": "ability_file" if diagnosis_source == "个人能力文件" else "generated_from_fit",
+                        "legacy_profile": diagnosis_bundle.legacy,
+                        "excluded_activity_count": len(excluded_activities),
+                        "excluded_activities": excluded_activities,
+                        "reference_time": snapshot_profile.get("reference_time"),
+                    }
                     analyzed["report"] = build_performance_report(analyzed)
                     st.session_state["diagnosis_result"] = analyzed
                     status.update(label="活动表现诊断完成", state="complete", expanded=False)
@@ -1212,12 +1474,14 @@ def render_performance_workflow() -> None:
                 logger.exception("performance diagnosis failed")
                 st.error(f"活动表现诊断过程中出现异常：{exc}")
         if not can_analyze:
-            st.caption("解析并确认基准 FIT，再上传一个独立的待诊断 FIT 后即可开始。")
+            st.caption("准备基准能力文件，再上传一个独立的待诊断 FIT 后即可开始。")
 
     if "diagnosis_result" in st.session_state:
         render_performance_result(st.session_state["diagnosis_result"])
     elif baseline_activities:
-        st.info("基准活动已解析。请确认活动类型，再在左侧上传一个独立的待诊断 FIT。")
+        st.info("基准活动已解析。请确认活动并生成基准能力文件，再上传待诊断 FIT。")
+    elif diagnosis_bundle is not None:
+        st.info("基准能力已准备完成，请在左侧上传待诊断 FIT。")
     else:
         st.markdown(
             """
@@ -1240,12 +1504,15 @@ with st.sidebar:
     st.markdown('<div class="mode-switch-label">功能模式</div>', unsafe_allow_html=True)
     app_mode = st.radio(
         "功能模式",
-        options=["比赛时间预测", "活动表现诊断"],
-        index=0,
+        options=["个人能力", "比赛时间预测", "活动表现诊断"],
+        index=1,
         key="app_mode",
         label_visibility="collapsed",
     )
     st.divider()
+if app_mode == "个人能力":
+    render_ability_workflow()
+    st.stop()
 if app_mode == "活动表现诊断":
     render_performance_workflow()
     st.stop()
@@ -1256,47 +1523,71 @@ with st.sidebar:
         '<div class="sidebar-copy">数据只在当前电脑中解析，不会上传到外部服务。</div>',
         unsafe_allow_html=True,
     )
-    step_heading(1, "上传历史 Activity FIT")
-    fit_files = st.file_uploader(
-        "选择多个 .fit 文件",
-        type=["fit"],
-        accept_multiple_files=True,
-        help="建议同时包含路跑、越野跑和长距离活动。",
+    prediction_source = st.radio(
+        "能力来源",
+        options=["个人能力文件", "历史 FIT"],
+        key="prediction_ability_source",
     )
-    st.caption("最多 30 个 FIT；单个文件不超过 20 MB；FIT 与 GPX 总计不超过 100 MB。")
-    st.info(
-        "隐私提示：FIT 和 GPX 可能包含精确位置、活动时间、心率等信息。"
-        "文件仅用于当前会话分析，不会写入项目仓库或作为用户数据长期保存。"
-    )
-    if fit_files:
-        st.caption(f"已选择 {len(fit_files)} 个 FIT 文件")
-        signature = upload_signature(fit_files)
-        if st.session_state.get("fit_upload_signature") != signature:
-            st.session_state["fit_upload_signature"] = signature
-            st.session_state.pop("parsed_activities", None)
-            st.session_state.pop("activity_review_rows", None)
-            st.session_state.pop("activity_review_signature", None)
-            st.session_state.pop("prediction_result", None)
-        if st.button("解析并确认活动", width="stretch", disabled=not fit_files):
-            try:
-                parsed, review_rows = parse_activity_uploads(fit_files)
-                st.session_state["parsed_activities"] = parsed
-                st.session_state["activity_review_rows"] = review_rows
-            except ValueError as exc:
-                st.session_state.pop("parsed_activities", None)
-                st.session_state.pop("activity_review_rows", None)
-                st.warning(str(exc))
-            except Exception:
-                st.session_state.pop("parsed_activities", None)
-                st.session_state.pop("activity_review_rows", None)
-                logger.exception("FIT upload processing failed")
-                st.error("活动分析过程中出现异常，请检查上传文件后重试。")
-    else:
-        st.session_state.pop("fit_upload_signature", None)
-        st.session_state.pop("parsed_activities", None)
-        st.session_state.pop("activity_review_rows", None)
-        st.session_state.pop("activity_review_signature", None)
+    if st.session_state.get("prediction_source_previous") != prediction_source:
+        st.session_state["prediction_source_previous"] = prediction_source
         st.session_state.pop("prediction_result", None)
+    fit_files: list[Any] = []
+    if prediction_source == "个人能力文件":
+        step_heading(1, "上传个人能力文件")
+        prediction_ability_file = st.file_uploader(
+            "选择 .ttp-profile 或旧版 .json",
+            key="prediction_ability_file",
+            help="文件格式由系统读取后校验。",
+        )
+        if prediction_ability_file is not None:
+            signature = upload_signature([prediction_ability_file])
+            if st.session_state.get("prediction_ability_signature") != signature:
+                st.session_state["prediction_ability_signature"] = signature
+                st.session_state.pop("prediction_result", None)
+                try:
+                    loaded_bundle = load_ability_bundle(prediction_ability_file)
+                    st.session_state["prediction_ability_bundle"] = refresh_ability_bundle(loaded_bundle)
+                except ValueError as exc:
+                    st.session_state.pop("prediction_ability_bundle", None)
+                    st.warning(str(exc))
+        else:
+            st.session_state.pop("prediction_ability_bundle", None)
+    else:
+        step_heading(1, "上传历史 Activity FIT")
+        fit_files = st.file_uploader(
+            "选择多个 .fit 文件",
+            type=["fit"],
+            accept_multiple_files=True,
+            key="prediction_fit_files",
+            help="建议同时包含路跑、越野跑和长距离活动。",
+        )
+        st.caption("最多 30 个 FIT；单个文件不超过 20 MB；FIT 与 GPX 总计不超过 100 MB。")
+        if fit_files:
+            st.caption(f"已选择 {len(fit_files)} 个 FIT 文件")
+            signature = upload_signature(fit_files)
+            if st.session_state.get("fit_upload_signature") != signature:
+                st.session_state["fit_upload_signature"] = signature
+                for key in ("parsed_activities", "activity_review_rows", "activity_review_signature",
+                            "prediction_generated_bundle", "prediction_result"):
+                    st.session_state.pop(key, None)
+            if st.button("解析并确认活动", width="stretch", disabled=not fit_files):
+                try:
+                    parsed, review_rows = parse_activity_uploads(fit_files)
+                    st.session_state["parsed_activities"] = parsed
+                    st.session_state["activity_review_rows"] = review_rows
+                except ValueError as exc:
+                    st.session_state.pop("parsed_activities", None)
+                    st.session_state.pop("activity_review_rows", None)
+                    st.warning(str(exc))
+                except Exception:
+                    st.session_state.pop("parsed_activities", None)
+                    st.session_state.pop("activity_review_rows", None)
+                    logger.exception("FIT upload processing failed")
+                    st.error("活动分析过程中出现异常，请检查上传文件后重试。")
+        else:
+            for key in ("fit_upload_signature", "parsed_activities", "activity_review_rows",
+                        "activity_review_signature", "prediction_generated_bundle"):
+                st.session_state.pop(key, None)
 
 st.markdown("# 越野跑比赛时间概率预测")
 st.markdown(
@@ -1304,8 +1595,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
-parsed_activities: dict[str, pd.DataFrame] = st.session_state.get("parsed_activities", {})
-review_rows: list[dict[str, Any]] = st.session_state.get("activity_review_rows", [])
+parsed_activities: dict[str, pd.DataFrame] = (
+    st.session_state.get("parsed_activities", {}) if prediction_source == "历史 FIT" else {}
+)
+review_rows: list[dict[str, Any]] = (
+    st.session_state.get("activity_review_rows", []) if prediction_source == "历史 FIT" else []
+)
 selected_activities: dict[str, pd.DataFrame] = {}
 confirmed_types: dict[str, str] = {}
 if parsed_activities and review_rows:
@@ -1322,10 +1617,42 @@ if parsed_activities and review_rows:
     if st.session_state.get("activity_review_signature") != review_signature:
         st.session_state["activity_review_signature"] = review_signature
         st.session_state.pop("prediction_result", None)
+        st.session_state.pop("prediction_generated_bundle", None)
     try:
         selected_activities, confirmed_types = apply_activity_review(parsed_activities, normalized_review)
     except ValueError as exc:
         st.warning(str(exc))
+
+prediction_bundle: AbilityBundle | None = (
+    st.session_state.get("prediction_ability_bundle")
+    if prediction_source == "个人能力文件"
+    else st.session_state.get("prediction_generated_bundle")
+)
+if prediction_source == "历史 FIT" and selected_activities:
+    if st.button("生成能力文件并继续", type="primary", key="prediction_build_ability"):
+        try:
+            hashes = activity_hashes_from_uploads(fit_files)
+            hashes = {name: hashes[name] for name in selected_activities}
+            with st.status("正在生成本次预测使用的个人能力文件", expanded=True) as status:
+                prediction_bundle = build_ability_bundle(
+                    selected_activities,
+                    confirmed_types,
+                    hashes,
+                    progress=lambda message: status.write(message.strip()),
+                )
+                st.session_state["prediction_generated_bundle"] = prediction_bundle
+                status.update(label="个人能力文件已生成", state="complete", expanded=False)
+        except ValueError as exc:
+            st.warning(str(exc))
+        except Exception as exc:
+            logger.exception("prediction ability generation failed")
+            st.error(f"个人能力文件生成失败：{exc}")
+
+if prediction_bundle is not None:
+    with st.expander("本次使用的个人能力", expanded=False):
+        render_ability_summary(prediction_bundle, "prediction_bundle")
+    if prediction_source == "历史 FIT":
+        render_ability_download(prediction_bundle, "prediction_ability_download", "下载本次生成的个人能力文件")
 
 with st.sidebar:
     step_heading(2, "上传比赛路线 GPX")
@@ -1396,7 +1723,7 @@ with st.sidebar:
     simulations = st.select_slider("模拟次数", options=[1000, 3000, 5000, 10000], value=3000)
 
     step_heading(4, "开始计算")
-    can_calculate = bool(selected_activities and gpx_file)
+    can_calculate = bool(prediction_bundle is not None and gpx_file)
     if st.button("开始计算", type="primary", disabled=not can_calculate, width="stretch"):
         try:
             validate_uploads(fit_files, gpx_file)
@@ -1416,6 +1743,7 @@ with st.sidebar:
                               carried_weight_kg=float(carried_weight), aid_station_minutes=float(aid_minutes),
                               race_start_time_utc=local_start.astimezone(timezone.utc)),
                 int(simulations),
+                profile=prediction_bundle.profile,
             )
         except ValueError as exc:
             st.session_state.pop("prediction_result", None)
@@ -1426,12 +1754,14 @@ with st.sidebar:
             st.error(f"分析过程中出现异常：{exc}")
             st.caption("请把上面这条完整错误信息发给开发者；后台日志仍保留完整调用堆栈。")
     if not can_calculate:
-        st.caption("解析并确认至少一个 FIT，同时上传 GPX 后即可开始计算。")
+        st.caption("准备个人能力文件并上传 GPX 后即可开始计算。")
 
 if "prediction_result" in st.session_state:
     render_result(st.session_state["prediction_result"])
 elif parsed_activities:
-    st.info("活动已解析。确认上方活动类型和建模选择后，在左侧上传 GPX 并开始计算。")
+    st.info("活动已解析。确认活动并生成能力文件后，在左侧上传 GPX 开始计算。")
+elif prediction_bundle is not None:
+    st.info("个人能力已准备完成，请在左侧上传比赛 GPX 并设置比赛条件。")
 else:
     st.markdown(
         """
@@ -1439,8 +1769,8 @@ else:
             <div class="empty-mark">⌁</div>
             <div class="empty-title">上传数据，开始一次路线预测</div>
             <div class="empty-copy">
-                在左侧选择历史 FIT，点击“解析并确认活动”。确认越野/路跑类型后上传比赛 GPX，
-                系统将建立个人能力画像并生成概率预测报告。
+                可以直接上传个人能力文件，也可以上传历史 FIT 并在页面内生成能力文件。
+                准备能力后上传比赛 GPX，系统将生成概率预测报告。
             </div>
         </div>
         """,

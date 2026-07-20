@@ -31,6 +31,13 @@ activity_type_weights:
   normal_training: 0.65
   recovery: 0.35
 
+ability_file:
+  schema_version: "1.0"
+  current_half_life_days: 90.0
+  long_term_half_life_days: 365.0
+  maximum_activities: 200
+  maximum_uncompressed_mb: 200
+
 confidence:
   default: 0.20
   duration_minutes:

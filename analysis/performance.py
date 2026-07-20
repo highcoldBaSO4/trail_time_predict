@@ -26,15 +26,19 @@ def analyze_performance(
     sample_distance_m: float = 100.0,
     simulations: int = 3000,
     progress: Callable[[str], None] | None = None,
+    profile: dict[str, object] | None = None,
 ) -> dict[str, object]:
     """Compare one independent FIT activity with a profile built from baseline FITs."""
-    if not baseline_activities:
+    if profile is None and not baseline_activities:
         raise ValueError("活动表现诊断至少需要一个历史基准 FIT")
     if target_activity.empty:
         raise ValueError("待诊断 FIT 没有有效记录")
 
-    _emit(progress, "建立不包含待诊断活动的基准能力画像……")
-    profile = build_runner_profile(baseline_activities, baseline_types, progress=progress)
+    if profile is None:
+        _emit(progress, "建立不包含待诊断活动的基准能力画像……")
+        profile = build_runner_profile(baseline_activities, baseline_types, progress=progress)
+    else:
+        _emit(progress, "使用个人能力文件中的独立基准画像……")
     points = fit_route_points(target_activity)
     if len(points) < 2:
         raise ValueError("待诊断 FIT 缺少有效轨迹坐标，无法生成诊断路线")

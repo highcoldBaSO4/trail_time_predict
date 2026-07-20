@@ -41,6 +41,8 @@ def build_runner_profile(
     activities: dict[str, pd.DataFrame],
     activity_type_overrides: dict[str, str] | None = None,
     progress: Callable[[str], None] | None = None,
+    reference_time: datetime | None = None,
+    recency_half_life_days: float | None = None,
 ) -> dict[str, object]:
     if not activities:
         raise ValueError("至少需要一个 FIT 活动才能生成能力画像")
@@ -61,7 +63,13 @@ def build_runner_profile(
         activity["_activity_name"] = name
         activity["_activity_type"] = activity_type
         activity["_model_weight"] = (
-            _activity_weight(name, activity, activity_type)
+            _activity_weight(
+                name,
+                activity,
+                activity_type,
+                reference_time=reference_time,
+                half_life_days=recency_half_life_days,
+            )
             * float(quality_reports[name].get("score", 0.2))
         )
         moving = activity["moving_interval"].fillna(False)
@@ -111,6 +119,11 @@ def build_runner_profile(
         activity_summaries.append(summary)
     profile: dict[str, object] = {
         "schema_version": "0.3",
+        "reference_time": _normalized_reference_time(reference_time).isoformat(),
+        "recency_weighting": {
+            "method": "exponential_half_life" if recency_half_life_days is not None else "configured_bands",
+            "half_life_days": None if recency_half_life_days is None else float(recency_half_life_days),
+        },
         "units": {
             "flat_pace": "seconds_per_km",
             "uphill": "vertical_metres_per_hour",
@@ -426,19 +439,43 @@ def _per_activity_weighted_rate(frame: pd.DataFrame, numerator: str, scale: floa
     return float(np.average(np.asarray(values), weights=np.asarray(weights)))
 
 
-def _activity_weight(name: str, frame: pd.DataFrame, activity_type: str) -> float:
-    """Combine configured activity recency and purpose weights."""
+def _activity_weight(
+    name: str,
+    frame: pd.DataFrame,
+    activity_type: str,
+    reference_time: datetime | None = None,
+    half_life_days: float | None = None,
+) -> float:
+    """Combine smooth activity recency decay and purpose weights."""
     config = load_config()
     valid_time = pd.to_datetime(frame["timestamp"], errors="coerce", utc=True).dropna()
-    age_days = max(0, (datetime.now(timezone.utc) - valid_time.max().to_pydatetime()).days) if not valid_time.empty else 9999
-    recency = 0.4
-    for band in config["activity_recency_weights"]:
-        if band["max_days"] is None or age_days <= int(band["max_days"]):
-            recency = float(band["weight"])
-            break
+    reference = _normalized_reference_time(reference_time)
+    age_days = (
+        max(0.0, (reference - valid_time.max().to_pydatetime()).total_seconds() / 86400.0)
+        if not valid_time.empty
+        else 9999.0
+    )
+    if half_life_days is None:
+        recency = 0.4
+        for band in config["activity_recency_weights"]:
+            if band["max_days"] is None or age_days <= float(band["max_days"]):
+                recency = float(band["weight"])
+                break
+    else:
+        half_life = float(half_life_days)
+        if half_life <= 0:
+            raise ValueError("活动日期权重半衰期必须大于0")
+        recency = 2.0 ** (-age_days / half_life)
     lowered = name.lower()
     purpose = "race" if any(word in lowered for word in ("race", "比赛")) else "recovery" if any(word in lowered for word in ("recovery", "恢复")) else "specific_training" if activity_type == "trail" else "normal_training"
     return recency * float(config["activity_type_weights"][purpose])
+
+
+def _normalized_reference_time(value: datetime | None) -> datetime:
+    reference = value or datetime.now(timezone.utc)
+    if reference.tzinfo is None:
+        return reference.replace(tzinfo=timezone.utc)
+    return reference.astimezone(timezone.utc)
 
 
 def _flat_source_summary(segments: pd.DataFrame) -> dict[str, float | int | None]:
