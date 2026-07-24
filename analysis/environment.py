@@ -35,6 +35,33 @@ def solar_elevation_degrees(timestamp: datetime | pd.Timestamp, latitude: float,
     return math.degrees(elevation)
 
 
+def solar_elevation_degrees_vector(
+    start_time: datetime | pd.Timestamp, elapsed_seconds: np.ndarray, latitude: float, longitude: float
+) -> np.ndarray:
+    """Vectorised solar elevation for Monte Carlo arrival-time paths."""
+    moment = pd.Timestamp(start_time)
+    if moment.tzinfo is None:
+        moment = moment.tz_localize("UTC")
+    else:
+        moment = moment.tz_convert("UTC")
+    timestamps = moment.timestamp() + np.asarray(elapsed_seconds, dtype=float)
+    days = timestamps / 86400.0 + 2440587.5 - 2451545.0
+    mean_longitude = np.deg2rad((280.460 + 0.9856474 * days) % 360.0)
+    mean_anomaly = np.deg2rad((357.528 + 0.9856003 * days) % 360.0)
+    ecliptic_longitude = mean_longitude + math.radians(1.915) * np.sin(mean_anomaly) + math.radians(0.020) * np.sin(2 * mean_anomaly)
+    obliquity = math.radians(23.439) - math.radians(0.0000004) * days
+    right_ascension = np.arctan2(np.cos(obliquity) * np.sin(ecliptic_longitude), np.cos(ecliptic_longitude))
+    declination = np.arcsin(np.sin(obliquity) * np.sin(ecliptic_longitude))
+    sidereal = np.deg2rad((280.46061837 + 360.98564736629 * days + float(longitude)) % 360.0)
+    hour_angle = (sidereal - right_ascension + math.pi) % (2 * math.pi) - math.pi
+    latitude_radians = math.radians(float(latitude))
+    elevation = np.arcsin(
+        math.sin(latitude_radians) * np.sin(declination)
+        + math.cos(latitude_radians) * np.cos(declination) * np.cos(hour_angle)
+    )
+    return np.rad2deg(elevation)
+
+
 def is_night(timestamp: datetime | pd.Timestamp, latitude: float, longitude: float) -> bool:
     """Return whether the sun is below the configured twilight threshold."""
     threshold = float(load_config()["environment"]["night_solar_elevation_degrees"])

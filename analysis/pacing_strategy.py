@@ -7,6 +7,7 @@ import pandas as pd
 
 from analysis.downhill import interpolate_downhill_speed
 from analysis.fatigue import build_fatigue_stages, fatigue_stage_for_duration, interpolate_fatigue
+from analysis.route_features import route_structure_features
 from analysis.uphill import interpolate_uphill_vam
 
 
@@ -30,7 +31,7 @@ def build_pacing_strategy_profile(
     before the curve is calculated, so the predictor can apply it separately.
     """
     if segments.empty:
-        return {"version": 1, "phase_centers": list(PHASE_CENTERS), "samples": [], "confidence": 0.2}
+        return {"version": 2, "phase_centers": list(PHASE_CENTERS), "samples": [], "confidence": 0.2}
 
     prepared = segments.copy()
     prepared["distance_progress"] = 0.0
@@ -59,7 +60,7 @@ def build_pacing_strategy_profile(
         values = np.asarray([float(item["confidence"]) for item in samples], dtype=float)
         confidence = float(np.average(values, weights=np.maximum(weights, 1e-6)))
     return {
-        "version": 1,
+        "version": 2,
         "phase_centers": list(PHASE_CENTERS),
         "samples": samples,
         "fatigue_stages": fatigue_stages,
@@ -154,6 +155,7 @@ def _activity_strategy(
             terrain: round(float(terrain_distance.get(terrain, 0.0)) / total_distance, 4)
             for terrain in TERRAINS
         },
+        "route_structure": route_structure_features(rows),
         "overall_curve": [round(value, 4) for value in overall_curve],
         "terrain_curves": {terrain: [round(value, 4) for value in curve] for terrain, curve in terrain_curves.items()},
         "strategy_type": strategy_type,

@@ -212,6 +212,91 @@ def race_temperature_at_elapsed(condition: object, elapsed_hours: float, estimat
     return float(np.interp(elapsed, [peak_at, total], [peak, finish]))
 
 
+def race_temperature_at_elapsed_vector(
+    condition: object, elapsed_hours: np.ndarray, estimated_hours: float
+) -> np.ndarray | None:
+    """Vectorised counterpart used by Monte Carlo paths with different arrival times."""
+    start = getattr(condition, "temperature_c", None)
+    if start is None:
+        return None
+    values = np.asarray(elapsed_hours, dtype=float)
+    peak_value = getattr(condition, "temperature_peak_c", None)
+    finish_value = getattr(condition, "temperature_finish_c", None)
+    peak_hour_value = getattr(condition, "temperature_peak_hour", None)
+    if peak_value is None and finish_value is None:
+        return np.full_like(values, float(start), dtype=float)
+    peak = float(start if peak_value is None else peak_value)
+    finish = float(peak if finish_value is None else finish_value)
+    total = max(0.01, float(estimated_hours))
+    peak_at = min(total, max(0.0, float(total / 2.0 if peak_hour_value is None else peak_hour_value)))
+    elapsed = np.clip(values, 0.0, total)
+    if peak_at <= 0.0:
+        return np.interp(elapsed, [0.0, total], [peak, finish])
+    if peak_at >= total:
+        return np.interp(elapsed, [0.0, total], [float(start), peak])
+    return np.where(
+        elapsed <= peak_at,
+        float(start) + (peak - float(start)) * elapsed / peak_at,
+        peak + (finish - peak) * (elapsed - peak_at) / max(total - peak_at, 1e-9),
+    )
+
+
+def temperature_time_factor_vector(profile: dict[str, object], temperatures_c: np.ndarray) -> np.ndarray:
+    curve = list(profile.get("temperature", {}).get("curve", []))
+    if not curve:
+        return np.ones_like(temperatures_c, dtype=float)
+    ordered = sorted((float(point["temperature_c"]), float(point["time_factor"])) for point in curve)
+    return np.interp(temperatures_c, [item[0] for item in ordered], [item[1] for item in ordered])
+
+
+def humidity_time_factor_vector(temperatures_c: np.ndarray, humidity_percent: float | None) -> np.ndarray:
+    if humidity_percent is None:
+        return np.ones_like(temperatures_c, dtype=float)
+    config = load_config()["temperature_model"]["humidity_interaction"]
+    activation = float(config["activation_temperature_c"])
+    full_effect = max(activation + 0.1, float(config["full_effect_temperature_c"]))
+    heat_activation = np.clip((temperatures_c - activation) / (full_effect - activation), 0.0, 1.0)
+    humidity_excess = max(0.0, float(humidity_percent) - float(config["threshold_percent"]))
+    return 1.0 + heat_activation * humidity_excess * float(config["per_percent_at_full_effect"])
+
+
+def temperature_fatigue_time_factor_vector(
+    profile: dict[str, object], temperatures_c: np.ndarray, elapsed_hours: np.ndarray
+) -> np.ndarray:
+    config = load_config()["temperature_model"]
+    reference = float(profile.get("temperature", {}).get("reference_temperature_c", 15.0))
+    threshold = reference + float(config["fatigue_threshold_above_reference_c"])
+    heat_degrees = np.maximum(0.0, temperatures_c - threshold)
+    factor = 1.0 + heat_degrees * np.maximum(0.0, elapsed_hours) * float(config["fatigue_time_increase_per_degree_hour"])
+    return np.minimum(float(config["maximum_fatigue_time_factor"]), factor)
+
+
+def heart_rate_heat_fatigue_time_factor_vector(
+    profile: dict[str, object], temperatures_c: np.ndarray, elapsed_hours: np.ndarray
+) -> np.ndarray:
+    heart_rate = profile.get("heart_rate", {})
+    heat = heart_rate.get("heat_sensitivity", {})
+    if heat.get("source") != "personal":
+        return np.ones_like(temperatures_c, dtype=float)
+    config = load_config()["heart_rate_model"]
+    temperature_config = load_config()["temperature_model"]
+    reference = float(profile.get("temperature", {}).get("reference_temperature_c", 15.0))
+    heat_degrees = np.maximum(0.0, temperatures_c - reference - float(temperature_config["fatigue_threshold_above_reference_c"]))
+    drift_at_five = interpolate_hr_drift(profile, 5.0)
+    drift_excess = max(0.0, drift_at_five - float(config["expected_drift_bpm_at_5h"]))
+    sensitivity_excess = max(
+        0.0,
+        float(heat.get("bpm_per_degree", 0.0)) - float(config["default_heat_sensitivity_bpm_per_degree"]),
+    ) * 10.0
+    evidence = drift_excess + sensitivity_excess
+    if evidence <= 0.0:
+        return np.ones_like(temperatures_c, dtype=float)
+    heat_ratio = np.minimum(2.0, heat_degrees / 10.0)
+    progress = np.minimum(2.0, np.maximum(0.0, elapsed_hours) / 5.0)
+    factor = 1.0 + heat_ratio * progress * evidence * float(config["heat_drift_time_factor_scale"]) * float(heat.get("confidence", 0.2))
+    return np.minimum(float(config["maximum_heat_drift_time_factor"]), factor)
+
+
 def temperature_fatigue_time_factor(
     profile: dict[str, object], temperature_c: float | None, elapsed_hours: float
 ) -> float:

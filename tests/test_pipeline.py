@@ -197,6 +197,12 @@ def test_profile_and_report_expose_four_slope_bands() -> None:
     assert "能力保留比例" in report
     assert "耗时修正倍率" in report
     assert "疲劳因子" in report
+    fatigue_header = "| 地形 | 节点 | 能力保留 | 耗时修正倍率 | 来源 | 证据 | 可信度 |"
+    fatigue_separator = "| --- | ---: | ---: | ---: | --- | --- | ---: |"
+    fatigue_lines = report.splitlines()
+    separator_index = fatigue_lines.index(fatigue_separator, fatigue_lines.index(fatigue_header))
+    assert fatigue_lines[separator_index + 1].startswith("| 平路 |")
+    assert fatigue_lines.index("> 疲劳修正规则：分段基础耗时 ÷ 能力保留比例。系统先验表示该节点缺少个人证据；保守外推用于超过个人最长观测时长的比赛后程。") > separator_index
     assert "FIT 移动时间识别" in report
     assert "补回的零距离时间" in report
 
@@ -793,7 +799,7 @@ def test_phase2_monte_carlo_is_reproducible() -> None:
     first = predict_race(profile, segments, simulations=1000, seed=99)
     second = predict_race(profile, segments, simulations=1000, seed=99)
     assert first["probability"] == second["probability"]
-    assert first["probability"]["method"] == "segmented_source_condition_physical_gpx"
+    assert first["probability"]["method"] == "segmented_dynamic_environment_source_condition_physical_gpx"
     assert set(first["probability"]["uncertainty"]["ability_confidence"]) == {"flat", "uphill", "downhill"}
     assert first["probability"]["uncertainty"]["gpx"]["mode"] == "segment_elevation_grade"
     assert "route_weighted_confidence" in first["probability"]["uncertainty"]
@@ -852,7 +858,7 @@ def test_probability_separates_condition_sources_and_gpx_geometry() -> None:
     assert uncertainty["condition_sources"]["form"]["active_time_share"] == 1.0
     assert uncertainty["condition_sources"]["technical"]["effective_sigma"] > 0
     assert uncertainty["condition_sources"]["mud"]["effective_sigma"] > 0
-    assert uncertainty["condition_sources"]["night"]["effective_sigma"] == 0
+    assert uncertainty["condition_sources"]["night"]["effective_sigma"] > 0
     assert uncertainty["gpx"]["affected_time_share"] == 1.0
     assert uncertainty["route_weighted_confidence"]["gpx_quality"] == 0.5
     assert prediction["probability"]["sigma"] > high_quality["probability"]["sigma"]

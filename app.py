@@ -27,10 +27,12 @@ from analysis.ability_file import (
     update_ability_bundle,
 )
 from analysis.performance import analyze_performance
+from analysis.backtest import run_rolling_backtest
 from analysis.activity_selection import ACTIVITY_TYPE_LABELS, LABEL_TO_ACTIVITY_TYPE, apply_activity_review, build_activity_review
 from analysis.data_quality import diagnose_gpx
 from analysis.temperature import calibrate_activity_temperature
 from analysis.weather import enrich_activity_with_historical_weather
+from ui.ability_charts import fatigue_figure, temperature_figure, terrain_ability_figure
 from ui.elevation_chart import elevation_figure
 from models import RaceCondition
 from parser.fit_reader import read_fit
@@ -288,7 +290,8 @@ def calculate_prediction(
         status.write("匹配个人能力并计算逐段时间……")
         try:
             prediction = predict_race(profile, segments, aid_minutes, condition=condition,
-                                      simulations=simulations, gpx_quality_score=float(gpx_quality["score"]))
+                                      simulations=simulations, gpx_quality_score=float(gpx_quality["score"]),
+                                      progress=lambda message: status.write(message))
         except ValueError:
             raise
         except Exception as exc:
@@ -598,6 +601,60 @@ def render_result(result: dict[str, Any]) -> None:
                 f"{source_label} · {strategy_labels.get(strategy_match.get('strategy_type'), strategy_match.get('strategy_type', '—'))} · "
                 f"可信度 {float(strategy_match.get('confidence', .2)):.0%}"
             )
+            route_structure = dict(target.get("route_structure", {}))
+            grade_bands = dict(route_structure.get("grade_bands", {}))
+            continuous = dict(route_structure.get("continuous", {}))
+            phases = dict(route_structure.get("phase_distribution", {}))
+            if grade_bands or continuous or phases:
+                with st.expander("目标路线结构摘要"):
+                    st.dataframe(
+                        pd.DataFrame([
+                            ["最长连续上坡", f"{float(continuous.get('longest_uphill_distance_km', 0)):.2f} km / +{float(continuous.get('longest_uphill_gain_m', 0)):.0f} m / {float(continuous.get('longest_uphill_average_grade_pct', 0)):.1f}%"],
+                            ["最长连续下坡", f"{float(continuous.get('longest_downhill_distance_km', 0)):.2f} km / -{float(continuous.get('longest_downhill_loss_m', 0)):.0f} m / {float(continuous.get('longest_downhill_average_grade_pct', 0)):.1f}%"],
+                            ["最大单次爬升", f"+{float(continuous.get('maximum_single_ascent_m', 0)):.0f} m"],
+                            ["最大单次下降", f"-{float(continuous.get('maximum_single_descent_m', 0)):.0f} m"],
+                        ], columns=["连续坡特征", "目标路线"]),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    st.dataframe(
+                        pd.DataFrame([
+                            [f"+{threshold}% 上坡", f"{float(grade_bands.get(f'uphill_{threshold}_distance_share', 0)):.1%}", f"{float(grade_bands.get(f'uphill_{threshold}_gain_share', 0)):.1%} 爬升"]
+                            for threshold in (10, 15, 20)
+                        ] + [
+                            [f"{threshold}% 下坡", f"{float(grade_bands.get(f'downhill_{abs(threshold)}_distance_share', 0)):.1%}", f"{float(grade_bands.get(f'downhill_{abs(threshold)}_loss_share', 0)):.1%} 下降"]
+                            for threshold in (-10, -15, -20)
+                        ], columns=["坡度段", "里程占比", "垂直量占比"]),
+                        hide_index=True,
+                        width="stretch",
+                    )
+                    phase_labels = (("first_25", "前25%"), ("second_25", "25%–50%"), ("third_25", "50%–75%"), ("last_25", "后25%"))
+                    st.dataframe(
+                        pd.DataFrame([
+                            [label, f"{float(dict(phases.get(name, {})).get('gain_share', 0)):.1%}", f"{float(dict(phases.get(name, {})).get('loss_share', 0)):.1%}", f"{float(dict(phases.get(name, {})).get('hard_uphill_gain_share', 0)):.1%}"]
+                            for name, label in phase_labels
+                        ], columns=["比赛进程", "爬升占比", "下降占比", "陡坡爬升占比"]),
+                        hide_index=True,
+                        width="stretch",
+                    )
+            similarity_labels = {
+                "scale": "路线规模", "grade_structure": "陡坡结构", "continuous_slope": "连续坡",
+                "terrain_sequence": "坡序与后程分布", "activity_type": "活动类型可靠性",
+            }
+            similarity_groups = dict(strategy_match.get("similarity_groups", {}))
+            if similarity_groups:
+                st.dataframe(
+                    pd.DataFrame(
+                        [[similarity_labels.get(name, name), f"{float(score):.0%}"] for name, score in similarity_groups.items()],
+                        columns=["路线相似度维度", "匹配度"],
+                    ),
+                    hide_index=True,
+                    width="stretch",
+                )
+            for reason in strategy_match.get("similarity_reasons", []):
+                st.caption(f"匹配提示：{reason}")
+            for reason in strategy_match.get("uncertainty", {}).get("reasons", []):
+                st.warning(f"区间处理：{reason}")
             terrain_labels = {"flat": "平路", "uphill": "上坡", "downhill": "下坡"}
             strategy_rows = []
             for terrain in ("flat", "uphill", "downhill"):
@@ -677,6 +734,42 @@ def render_result(result: dict[str, Any]) -> None:
                 f"坡段影响占比 {float(gpx_uncertainty.get('affected_time_share', 0)):.1%}，"
                 f"垂直误差波动 {float(gpx_uncertainty.get('vertical_sigma', uncertainty.get('gpx_sigma', 0))):.1%}。"
             )
+        calibration = dict(prediction.get("calibration", {}))
+        if calibration:
+            st.subheader("历史回测校准")
+            calibration_metrics = st.columns(4)
+            calibration_metrics[0].metric("校准状态", str(calibration.get("status", "未启用")))
+            calibration_metrics[1].metric("有效回测", f"{int(calibration.get('valid_backtest_count', 0))} 条")
+            calibration_metrics[2].metric(
+                "P50 修正",
+                f"×{float(calibration.get('p50_factor', 1.0)):.3f}",
+                delta=(
+                    f"{format_duration(float(calibration.get('p50_after_seconds', 0)) - float(calibration.get('p50_before_seconds', 0)))}"
+                    if calibration.get("enabled") else "未改写"
+                ),
+            )
+            calibration_metrics[3].metric(
+                "目标路线相近度",
+                "—" if calibration.get("target_route_similarity") is None else f"{float(calibration['target_route_similarity']):.0%}",
+            )
+            st.caption(str(calibration.get("note", "未使用历史回测校准。")))
+            st.dataframe(
+                pd.DataFrame(
+                    [
+                        ["P50", format_duration(float(calibration.get("p50_before_seconds", 0))), format_duration(float(calibration.get("p50_after_seconds", 0)))],
+                        ["P10", format_duration(float(calibration.get("p10_before_seconds", 0))), format_duration(float(calibration.get("p10_after_seconds", 0)))],
+                        ["P90", format_duration(float(calibration.get("p90_before_seconds", 0))), format_duration(float(calibration.get("p90_after_seconds", 0)))],
+                    ],
+                    columns=["分位", "校准前", "校准后"],
+                ),
+                hide_index=True,
+                width="stretch",
+            )
+            extra_reasons = list(calibration.get("interval_external_reasons", []))
+            st.caption(
+                f"区间来源：{calibration.get('interval_source', '未启用')}；"
+                + ("额外保守放宽：" + "、".join(extra_reasons) + "。" if extra_reasons else "没有额外外推放宽。")
+            )
         st.subheader("时间损耗拆解")
         labels = {"base_terrain": "基础地形", "heart_rate_pacing": "心率强度配速",
                   "duration_adaptation": "目标时长适配", "pacing_strategy": "比赛配速策略", "fatigue": "疲劳",
@@ -732,53 +825,36 @@ def render_result(result: dict[str, Any]) -> None:
         flat2.metric("较快配速（P25）", f"{format_pace(float(flat['threshold_pace']))}/km")
         flat3.metric("自然平路样本", f"{int(flat.get('qualified_segments', 0))} 段")
         flat4.metric("平路可信度", f"{float(flat.get('confidence', .2)):.0%}")
-        st.subheader("上坡能力")
-        st.dataframe(ability_table(profile, "uphill"), hide_index=True, width="stretch")
-        st.subheader("下坡能力")
-        st.dataframe(ability_table(profile, "downhill"), hide_index=True, width="stretch")
-        st.subheader("疲劳阶段与基础能力取样")
+        uphill_column, downhill_column = st.columns(2)
+        with uphill_column:
+            st.subheader("上坡能力")
+            figure = terrain_ability_figure(profile, "uphill")
+            st.pyplot(figure, width="stretch")
+            plt.close(figure)
+            st.caption("圆点为个人或混合证据；空心方块表示系统先验。数值为 VAM（每小时爬升米数）。")
+        with downhill_column:
+            st.subheader("下坡能力")
+            figure = terrain_ability_figure(profile, "downhill")
+            st.pyplot(figure, width="stretch")
+            plt.close(figure)
+            st.caption("圆点为个人或混合证据；空心方块表示系统先验。速度越高代表可维持的下坡速度越快。")
         stages = profile.get("fatigue_stages", {})
         base_sampling = profile.get("base_ability_sampling", {})
-        stage_rows = []
-        for terrain, label in (("flat", "平路"), ("uphill", "上坡"), ("downhill", "下坡")):
-            values = stages.get("terrain", {}).get(terrain, {})
-            stage_rows.append([
-                label,
-                f"{float(values.get('fresh_end_hour', 3)):.2f}h",
-                f"{float(values.get('mild_end_hour', 5)):.2f}h",
-                f"{float(values.get('moderate_end_hour', 8)):.2f}h",
-            ])
-        st.dataframe(
-            pd.DataFrame(stage_rows, columns=["地形", "97%保留", "90%保留", "80%保留"]),
-            hide_index=True,
-            width="stretch",
+        st.subheader("长时间疲劳曲线（按地形与证据）")
+        fatigue = profile["fatigue"]
+        figure = fatigue_figure(fatigue)
+        st.pyplot(figure, width="stretch")
+        plt.close(figure)
+        overall_stages = stages.get("overall", {})
+        st.caption(
+            f"97% / 90% / 80% 保留阈值分别约在 {float(overall_stages.get('fresh_end_hour', 3)):.2f}h / "
+            f"{float(overall_stages.get('mild_end_hour', 5)):.2f}h / {float(overall_stages.get('moderate_end_hour', 8)):.2f}h。"
+            "圆点为个人或混合证据，空心方块为系统先验，空心三角为保守外推。"
         )
         st.caption(
-            f"基础能力使用 {int(base_sampling.get('selected_activity_count', 0))} 条完整落在新鲜阶段的活动，"
-            f"统一新鲜边界为 {float(base_sampling.get('fresh_end_hour', 3)):.2f}h；"
-            "更长活动继续用于比赛策略和疲劳，不按全程数据量主导基础能力。"
+            f"基础能力使用 {int(base_sampling.get('selected_activity_count', 0))} 条完整落在新鲜阶段的活动；"
+            "预测按“分段基础耗时 ÷ 能力保留比例”修正。"
         )
-        st.subheader("长时间疲劳衰减")
-        fatigue = profile["fatigue"]
-        fatigue_rows = []
-        for time_range, key in (("0–3 小时", "3h"), ("3–5 小时", "5h"), ("5 小时以上", "8h")):
-            retained = float(fatigue[key])
-            fatigue_rows.append(
-                [time_range, f"{retained * 100:.0f}%", f"×{1.0 / max(retained, 0.1):.2f}"]
-            )
-        st.dataframe(
-            pd.DataFrame(fatigue_rows, columns=["累计移动时间", "能力保留比例", "耗时修正倍率"]),
-            hide_index=True,
-            width="stretch",
-        )
-        st.caption("预测按“分段基础耗时 ÷ 能力保留比例”应用疲劳修正。")
-        st.subheader("地形归一化连续疲劳曲线")
-        curve_rows = []
-        for terrain, label in (("flat", "平路"), ("uphill", "上坡"), ("downhill", "下坡")):
-            for point in fatigue.get(terrain, []):
-                confidence = "—（固定基准）" if point.get("source") == "anchor" else f"{float(point.get('confidence', .2)):.0%}"
-                curve_rows.append([label, f"{float(point['hour']):g}h", f"{float(point['factor']):.0%}", confidence])
-        st.dataframe(pd.DataFrame(curve_rows, columns=["地形", "时间", "能力保留", "可信度"]), hide_index=True, width="stretch")
         temperature_profile = profile.get("temperature", {})
         st.subheader("个人温度耐受")
         temperature_coverage = temperature_profile.get("coverage", {})
@@ -792,6 +868,10 @@ def render_result(result: dict[str, Any]) -> None:
         temp1.metric("最佳温度范围", best_text)
         temp2.metric("温度模型可信度", f"{float(temperature_profile.get('confidence', .2)):.0%}")
         temp3.metric("温度活动覆盖", f"{int(temperature_coverage.get('activity_count', 0))} 个")
+        figure = temperature_figure(temperature_profile)
+        st.pyplot(figure, width="stretch")
+        plt.close(figure)
+        st.caption("实线为最终温度耐受曲线，虚线为系统先验；圆点表示个人与先验混合，空心方块表示该温度节点缺少个人证据。")
         device_low = temperature_coverage.get("device_minimum_c")
         device_high = temperature_coverage.get("device_maximum_c")
         if temperature_calibration.get("source") == "wrist_relative_only":
@@ -806,28 +886,6 @@ def render_result(result: dict[str, Any]) -> None:
                 f"基础建模权重 {float(temperature_calibration.get('model_weight', .75)):.0%}；"
                 "太阳辐射和腕表相对升温只用于降低局地暴露较强样本的权重，不会被当成环境绝对温度；"
                 f"{temperature_calibration.get('spatial_resolution_note', '山区微气候可能存在偏差')}。"
-            )
-        temperature_rows = [
-            [
-                f"{float(point['temperature_c']):g}℃",
-                f"×{float(point.get('default_time_factor', point['time_factor'])):.3f}",
-                "—" if point.get("personal_time_factor") is None else f"×{float(point['personal_time_factor']):.3f}",
-                f"×{float(point['time_factor']):.3f}",
-                int(point.get("activity_count", 0)),
-                f"{float(point.get('sample_duration_seconds', 0)) / 3600.0:.1f} h",
-                f"{float(point.get('confidence', .2)):.0%}",
-                f"{float(point.get('personal_weight', 0)):.0%}",
-                _temperature_source_label(point.get("source", "default")),
-            ]
-            for point in temperature_profile.get("curve", [])
-        ]
-        if temperature_rows:
-            st.dataframe(
-                pd.DataFrame(
-                    temperature_rows,
-                    columns=["温度", "默认系数", "个人原始系数", "最终系数", "活动数", "有效时长", "节点可信度", "个人权重", "来源"],
-                ),
-                hide_index=True, width="stretch",
             )
         heart_rate_profile = profile.get("heart_rate", {})
         aerobic = heart_rate_profile.get("aerobic_range", {})
@@ -1038,7 +1096,37 @@ def render_performance_result(result: dict[str, Any]) -> None:
             hide_index=True,
             width="stretch",
         )
-        st.info("当前为 V0.4 Phase 1 基础对比。技术难度、泥泞、负重和主观状态未知时保持中性，不会强行解释剩余偏差。")
+        history = dict(result.get("model_history", {}))
+        if history.get("available") is False:
+            st.caption(f"模型历史表现：{history.get('reason')}")
+        elif history:
+            overall = dict(history.get("metrics", {}).get("overall", {}))
+            calibration = dict(history.get("metrics", {}).get("calibration", {}))
+            st.subheader("模型历史表现")
+            history_metrics = st.columns(4)
+            history_metrics[0].metric("可用回测场次", int(overall.get("count", 0)))
+            signed_error = overall.get("signed_mean_error")
+            history_metrics[1].metric("P50 系统偏差", "—" if signed_error is None else f"{float(signed_error):+.1%}")
+            coverage = overall.get("p10_p90_coverage")
+            history_metrics[2].metric("P10–P90 覆盖率", "—" if coverage is None else f"{float(coverage):.0%}")
+            history_metrics[3].metric("校准状态", str(calibration.get("status", "未启用")))
+            st.caption(str(calibration.get("note", "历史回测仅用于评估，不会自动改写本次预测。")))
+            route_ablation = dict(history.get("metrics", {}).get("route_similarity_ablation", {}))
+            if route_ablation:
+                labels = {"structural": "阶段 2 结构相似度", "legacy": "旧路线规模相似度", "duration_fallback": "仅时长能力层回退"}
+                st.caption("路线策略消融对比（同一无泄漏回测集）：")
+                st.dataframe(
+                    pd.DataFrame([
+                        [labels.get(mode, mode), int(values.get("count", 0)),
+                         "—" if values.get("signed_mean_error") is None else f"{float(values['signed_mean_error']):+.1%}",
+                         "—" if values.get("mean_absolute_percentage_error") is None else f"{float(values['mean_absolute_percentage_error']):.1%}",
+                         "—" if values.get("p10_p90_coverage") is None else f"{float(values['p10_p90_coverage']):.0%}"]
+                        for mode, values in route_ablation.items()
+                    ], columns=["策略", "回测场次", "P50 系统偏差", "MAPE", "P10–P90 覆盖率"]),
+                    hide_index=True,
+                    width="stretch",
+                )
+        st.info("当前为 V0.4 Phase 2：路线结构相似度已纳入配速策略；技术难度、泥泞、负重和主观状态未知时保持中性，不会强行解释剩余偏差。")
 
     with terrain_tab:
         terrain_rows = []
@@ -1106,14 +1194,11 @@ def render_ability_summary(bundle: AbilityBundle, key_prefix: str) -> None:
     columns[0].metric("有效活动", int(summary["activity_count"]))
     columns[1].metric("平路可信度", f"{float(summary['flat_confidence']):.0%}")
     latest = summary.get("latest_activity")
-    columns[2].metric("最近活动", str(latest)[:10] if latest else "旧版未知")
-    columns[3].metric("文件能力", "可增量更新" if summary["supports_update"] else "旧版只读")
-    if bundle.legacy:
-        st.warning("这是旧版 runner_profile.json：可用于预测，但缺少逐活动证据，不能可靠增量更新或重建历史诊断快照。")
-    else:
-        reference = str(summary.get("reference_time") or "")[:10]
-        earliest = str(summary.get("earliest_activity") or "")[:10]
-        st.caption(f"活动日期范围：{earliest or '未知'} 至 {str(latest)[:10] if latest else '未知'}；能力参考日期：{reference or '未知'}。")
+    columns[2].metric("最近活动", str(latest)[:10] if latest else "未知")
+    columns[3].metric("文件能力", "可增量更新")
+    reference = str(summary.get("reference_time") or "")[:10]
+    earliest = str(summary.get("earliest_activity") or "")[:10]
+    st.caption(f"活动日期范围：{earliest or '未知'} 至 {str(latest)[:10] if latest else '未知'}；能力参考日期：{reference or '未知'}。")
     profile = bundle.profile
     uphill, downhill = st.columns(2)
     with uphill:
@@ -1157,9 +1242,9 @@ def render_ability_workflow() -> None:
         if operation == "更新个人能力":
             step_heading(1, "上传已有能力文件")
             existing_file = st.file_uploader(
-                "选择 .ttp-profile 或旧版 .json 文件",
+                "选择 .ttp-profile 文件",
                 key="ability_existing_file",
-                help="文件格式由系统读取后校验，支持新版 .ttp-profile 和旧版 runner_profile.json。",
+                help="仅支持包含活动证据的新版 .ttp-profile 个人能力文件。",
             )
         step_heading(2 if existing_file is not None else 1, "上传新增 Activity FIT")
         fit_files = st.file_uploader(
@@ -1288,9 +1373,9 @@ def render_performance_workflow() -> None:
         if diagnosis_source == "个人能力文件":
             step_heading(1, "上传个人能力文件")
             diagnosis_ability_file = st.file_uploader(
-                "选择 .ttp-profile 或旧版 .json",
+                "选择 .ttp-profile 文件",
                 key="diagnosis_ability_file",
-                help="文件格式由系统读取后校验。",
+                help="仅支持包含活动证据的新版 .ttp-profile 个人能力文件。",
             )
             if diagnosis_ability_file is not None:
                 signature = upload_signature([diagnosis_ability_file])
@@ -1458,10 +1543,16 @@ def render_performance_workflow() -> None:
                     )
                     analyzed["ability_context"] = {
                         "source": "ability_file" if diagnosis_source == "个人能力文件" else "generated_from_fit",
-                        "legacy_profile": diagnosis_bundle.legacy,
                         "excluded_activity_count": len(excluded_activities),
                         "excluded_activities": excluded_activities,
                         "reference_time": snapshot_profile.get("reference_time"),
+                    }
+                    analyzed["model_history"] = {
+                        "available": False,
+                        "reason": (
+                            "尚未运行历史回测；可在诊断完成后单独运行。"
+                            if diagnosis_bundle.supports_update else "个人能力文件缺少可用于无泄漏回测的活动证据。"
+                        ),
                     }
                     analyzed["report"] = build_performance_report(analyzed)
                     st.session_state["diagnosis_result"] = analyzed
@@ -1477,6 +1568,23 @@ def render_performance_workflow() -> None:
             st.caption("准备基准能力文件，再上传一个独立的待诊断 FIT 后即可开始。")
 
     if "diagnosis_result" in st.session_state:
+        diagnosis_result = st.session_state["diagnosis_result"]
+        history = dict(diagnosis_result.get("model_history", {}))
+        if history.get("available") is False and diagnosis_bundle is not None and diagnosis_bundle.supports_update:
+            if st.button("运行历史滚动回测", key="diagnosis_run_backtest", help="逐场重建历史快照，通常需要数分钟。"):
+                try:
+                    with st.status("正在执行无泄漏历史回测", expanded=True) as status:
+                        history = run_rolling_backtest(
+                            diagnosis_bundle,
+                            simulations=1000,
+                            progress=lambda message: status.write(message),
+                        )
+                        diagnosis_result["model_history"] = history
+                        diagnosis_result["report"] = build_performance_report(diagnosis_result)
+                        st.session_state["diagnosis_result"] = diagnosis_result
+                        status.update(label="历史回测完成", state="complete", expanded=False)
+                except ValueError as exc:
+                    st.warning(str(exc))
         render_performance_result(st.session_state["diagnosis_result"])
     elif baseline_activities:
         st.info("基准活动已解析。请确认活动并生成基准能力文件，再上传待诊断 FIT。")
@@ -1535,9 +1643,9 @@ with st.sidebar:
     if prediction_source == "个人能力文件":
         step_heading(1, "上传个人能力文件")
         prediction_ability_file = st.file_uploader(
-            "选择 .ttp-profile 或旧版 .json",
+            "选择 .ttp-profile 文件",
             key="prediction_ability_file",
-            help="文件格式由系统读取后校验。",
+            help="仅支持包含活动证据的新版 .ttp-profile 个人能力文件。",
         )
         if prediction_ability_file is not None:
             signature = upload_signature([prediction_ability_file])
@@ -1651,8 +1759,51 @@ if prediction_source == "历史 FIT" and selected_activities:
 if prediction_bundle is not None:
     with st.expander("本次使用的个人能力", expanded=False):
         render_ability_summary(prediction_bundle, "prediction_bundle")
-    if prediction_source == "历史 FIT":
-        render_ability_download(prediction_bundle, "prediction_ability_download", "下载本次生成的个人能力文件")
+    if prediction_bundle.supports_update:
+        calibration_model = prediction_bundle.profile.get("prediction_calibration", {})
+        with st.expander("历史回测校准", expanded=not bool(calibration_model)):
+            if isinstance(calibration_model, dict) and calibration_model:
+                st.caption(
+                    f"状态：{calibration_model.get('status', '未启用')} · "
+                    f"高质量无泄漏回测：{int(calibration_model.get('valid_backtest_count', 0))} 条 · "
+                    f"P50 基准系数：×{float(dict(calibration_model.get('p50', {})).get('factor', 1.0)):.3f}"
+                )
+                st.caption(str(calibration_model.get("note", "校准模型仅使用历史滚动回测，不包含未来比赛。")))
+                rerun_label = "重新运行历史回测并更新校准"
+            else:
+                st.caption("尚未运行无泄漏历史回测。运行后才会按样本门槛决定是否对未来预测进行保守校准。")
+                rerun_label = "运行历史回测并准备预测校准"
+            if st.button(rerun_label, key="prediction_run_calibration_backtest", width="stretch"):
+                try:
+                    with st.status("正在执行无泄漏历史回测与校准建模", expanded=True) as status:
+                        history = run_rolling_backtest(
+                            prediction_bundle,
+                            simulations=1000,
+                            progress=lambda message: status.write(message),
+                        )
+                        calibration = dict(history.get("metrics", {}).get("calibration", {}))
+                        model = dict(calibration.get("model", {}))
+                        if not model:
+                            raise ValueError("历史回测未生成可用的校准证据")
+                        prediction_bundle.profile["prediction_calibration"] = model
+                        state_key = "prediction_ability_bundle" if prediction_source == "个人能力文件" else "prediction_generated_bundle"
+                        st.session_state[state_key] = prediction_bundle
+                        st.session_state.pop("prediction_result", None)
+                        status.update(label="历史回测与校准建模完成", state="complete", expanded=False)
+                    st.success(str(calibration.get("note", "历史回测校准模型已保存到本次能力文件。")))
+                except ValueError as exc:
+                    st.warning(str(exc))
+                except Exception:
+                    logger.exception("prediction calibration backtest failed")
+                    st.error("历史回测校准失败，请检查活动证据后重试。")
+    if prediction_bundle.supports_update:
+        has_calibration = isinstance(prediction_bundle.profile.get("prediction_calibration"), dict)
+        download_label = (
+            "下载本次生成的个人能力文件" if prediction_source == "历史 FIT"
+            else "下载已校准个人能力文件" if has_calibration
+            else "下载当前个人能力文件"
+        )
+        render_ability_download(prediction_bundle, "prediction_ability_download", download_label)
 
 with st.sidebar:
     step_heading(2, "上传比赛路线 GPX")

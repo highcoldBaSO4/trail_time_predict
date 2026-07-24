@@ -37,11 +37,10 @@ class AbilityBundle:
     activity_types: dict[str, str] = field(default_factory=dict)
     activity_hashes: dict[str, str] = field(default_factory=dict)
     manifest: dict[str, object] = field(default_factory=dict)
-    legacy: bool = False
 
     @property
     def supports_update(self) -> bool:
-        return bool(self.activities) and not self.legacy
+        return bool(self.activities)
 
 
 def build_ability_bundle(
@@ -148,7 +147,7 @@ def update_ability_bundle(
 
 def serialize_ability_bundle(bundle: AbilityBundle) -> bytes:
     if not bundle.supports_update:
-        raise ValueError("旧版只读能力画像不能保存为可更新的个人能力文件")
+        raise ValueError("个人能力文件缺少可更新的活动证据")
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
         archive.writestr(MANIFEST_NAME, _json_bytes(bundle.manifest))
@@ -171,7 +170,7 @@ def load_ability_bundle(source: bytes | bytearray | Any) -> AbilityBundle:
     if not raw:
         raise ValueError("个人能力文件为空")
     if not zipfile.is_zipfile(io.BytesIO(raw)):
-        return _load_legacy_profile(raw)
+        raise ValueError("仅支持新版 .ttp-profile 个人能力文件，请重新上传历史 FIT 生成新版文件")
 
     config = _ability_file_config()
     maximum_bytes = int(float(config["maximum_uncompressed_mb"]) * 1024 * 1024)
@@ -191,6 +190,8 @@ def load_ability_bundle(source: bytes | bytearray | Any) -> AbilityBundle:
             if MANIFEST_NAME not in names or PROFILE_NAME not in names:
                 raise ValueError("个人能力文件缺少 manifest.json 或 profile.json")
             manifest = _read_json(archive.read(MANIFEST_NAME), "能力文件清单")
+            if manifest.get("format") != "trail-time-predict-ability":
+                raise ValueError("不是受支持的新版 .ttp-profile 个人能力文件")
             profile = _read_json(archive.read(PROFILE_NAME), "个人能力画像")
             _validate_profile(profile)
             activities: dict[str, pd.DataFrame] = {}
@@ -224,13 +225,20 @@ def refresh_ability_bundle(
 ) -> AbilityBundle:
     if not bundle.supports_update:
         return bundle
-    return build_ability_bundle(
+    refreshed = build_ability_bundle(
         bundle.activities,
         bundle.activity_types,
         bundle.activity_hashes,
         reference_time=reference_time,
         progress=progress,
     )
+    # A calibration model is valid only for exactly the activity evidence it
+    # was backtested against.  Keep a matching, portable model when reopening
+    # an ability file; new/removed FITs automatically invalidate it.
+    calibration = bundle.profile.get("prediction_calibration")
+    if isinstance(calibration, dict) and calibration.get("activity_evidence_fingerprint") == _activity_evidence_fingerprint(bundle):
+        refreshed.profile["prediction_calibration"] = dict(calibration)
+    return refreshed
 
 
 def profile_before_activity(
@@ -283,6 +291,11 @@ def dataframe_fingerprint(name: str, frame: pd.DataFrame) -> str:
     return digest.hexdigest()
 
 
+def _activity_evidence_fingerprint(bundle: AbilityBundle) -> str:
+    payload = json.dumps(sorted(bundle.activity_hashes.values()), separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
 def ability_bundle_summary(bundle: AbilityBundle) -> dict[str, object]:
     dates: list[pd.Timestamp] = []
     for frame in bundle.activities.values():
@@ -296,7 +309,6 @@ def ability_bundle_summary(bundle: AbilityBundle) -> dict[str, object]:
         "generated_at": bundle.profile.get("generated_at"),
         "reference_time": bundle.profile.get("reference_time", bundle.profile.get("generated_at")),
         "supports_update": bundle.supports_update,
-        "legacy": bundle.legacy,
         "flat_confidence": float(dict(bundle.profile.get("flat", {})).get("confidence", 0.2)),
     }
 
@@ -346,12 +358,6 @@ def _frame_from_payload(payload: dict[str, object]) -> pd.DataFrame:
     if isinstance(attrs, dict):
         frame.attrs.update(attrs)
     return frame
-
-
-def _load_legacy_profile(raw: bytes) -> AbilityBundle:
-    profile = _read_json(raw, "旧版个人能力画像")
-    _validate_profile(profile)
-    return AbilityBundle(profile=profile, legacy=True, manifest={"format": "legacy-runner-profile"})
 
 
 def _validate_profile(profile: object) -> None:

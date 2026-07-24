@@ -19,6 +19,17 @@ default_profile:
     uphill: [{hour: 0.0, factor: 1.0}, {hour: 3.0, factor: 1.0}, {hour: 5.0, factor: 0.88}, {hour: 8.0, factor: 0.76}]
     downhill: [{hour: 0.0, factor: 1.0}, {hour: 3.0, factor: 1.0}, {hour: 5.0, factor: 0.88}, {hour: 8.0, factor: 0.72}]
 
+fatigue_model:
+  fresh_reference_start_hour: 0.5
+  fresh_reference_end_hour: 1.5
+  node_window_minutes: 30.0
+  minimum_window_minutes: 15.0
+  minimum_activity_coverage_ratio: 0.97
+  full_node_activity_count: 3
+  tail_decline_prior: 0.015
+  maximum_extrapolation_hours: 12.0
+  minimum_retention_factor: 0.45
+
 activity_recency_weights:
   - {max_days: 30, weight: 1.0}
   - {max_days: 90, weight: 0.85}
@@ -90,6 +101,33 @@ duration_capability:
     - {name: ultra, label: 超长, min_hours: 10.0, max_hours: null, center_hours: 12.0, fallback_time_factor: 1.16}
   convergence_tolerance_seconds: 30.0
   max_iterations: 8
+
+dynamic_environment:
+  deterministic_max_iterations: 8
+  convergence_tolerance_seconds: 20.0
+  uncertainty:
+    user_input_sigma_scale: 0.45
+    route_confirmed_sigma_scale: 0.70
+    unknown_sigma_scale: 1.25
+    unknown_prior_activation: 0.20
+  correlation:
+    weather_heat: 0.85
+    technical_mud: 0.75
+
+route_similarity:
+  group_weights:
+    scale: 0.30
+    grade_structure: 0.22
+    continuous_slope: 0.18
+    terrain_sequence: 0.20
+    activity_type: 0.10
+  minimum_historical_similarity: 0.22
+  maximum_matched_activities: 5
+  low_similarity_threshold: 0.42
+  structure_extrapolation_ratio: 1.25
+  uncertainty_sigma:
+    low_similarity: 0.045
+    uncovered_structure: 0.030
 
 conditions:
   current_form:
@@ -210,3 +248,38 @@ monte_carlo:
   terrain_correlation: 0.70
   fatigue_sigma_scale: 0.60
   duration_sigma_scale: 0.50
+
+backtest:
+  simulations: 1000
+  seed: 2026
+  route_similarity_ablation: true
+
+# 阶段 4：仅使用严格无泄漏滚动回测的去标识化残差。样本不足时只展示证据，
+# 不改写任何未来预测；已启用时也始终向 ×1.00 收缩，并且不缩窄原有区间。
+prediction_calibration:
+  minimum_valid_backtests: 3
+  full_enable_backtests: 5
+  minimum_quality_score: 0.65
+  recency_half_life_days: 180.0
+  target_similarity:
+    minimum_strength: 0.35
+  p50:
+    minimum_stable_log_bias: 0.012
+    minimum_direction_support: 0.70
+    outlier_log_clip: 0.25
+    shrinkage_prior_count: 6.0
+    observe_strength: 0.55
+    observe_max_log_adjustment: 0.04
+    enabled_max_log_adjustment: 0.10
+  terrain:
+    minimum_valid_backtests: 8
+    minimum_stable_log_bias: 0.015
+    minimum_direction_support: 0.70
+    maximum_log_adjustment: 0.04
+  interval:
+    global_prior_log_half_width: 0.16
+    maximum_log_half_width: 0.45
+    external_log_width:
+      route_similarity_max: 0.04
+      fatigue_extrapolation: 0.025
+      unknown_condition: 0.02

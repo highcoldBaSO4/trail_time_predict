@@ -4,10 +4,12 @@ import json
 from dataclasses import replace
 from datetime import timedelta, timezone
 from pathlib import Path
+from typing import Callable
 
 from analysis.downhill import interpolate_downhill_speed
 from analysis.environment import relative_altitude_factor, solar_elevation_degrees
 from analysis.fatigue import interpolate_fatigue
+from analysis.calibration import calibrate_prediction_interval
 from analysis.uphill import interpolate_uphill_vam
 from analysis.heart_rate import heart_rate_pacing_adjustment, interpolate_hr_drift
 from analysis.temperature import (
@@ -34,6 +36,8 @@ def predict_race(
     simulations: int | None = None,
     seed: int | None = None,
     gpx_quality_score: float = 1.0,
+    route_strategy_matching_mode: str = "structural",
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     """Predict standard, condition-adjusted and probabilistic race times."""
     if not segments:
@@ -45,22 +49,31 @@ def predict_race(
 
     estimate_hours = _initial_estimate_hours(profile, segments)
     duration_config = load_config()["duration_capability"]
+    dynamic_config = dict(load_config().get("dynamic_environment", {}))
     converged = False
     standard_rows: list[dict[str, object]] = []
     standard_seconds = 0.0
-    for iteration in range(1, int(duration_config["max_iterations"]) + 1):
-        route_pacing_match = match_route_pacing_strategy(profile, segments, estimate_hours)
-        standard_rows, standard_seconds, _ = _predict_once(
-            profile, segments, estimate_hours, RaceCondition(), route_pacing_match, apply_environment=False
+    adjusted_rows: list[dict[str, object]] = []
+    adjusted_seconds = 0.0
+    max_iterations = int(dynamic_config.get("deterministic_max_iterations", duration_config["max_iterations"]))
+    tolerance_seconds = float(dynamic_config.get("convergence_tolerance_seconds", duration_config["convergence_tolerance_seconds"]))
+    for iteration in range(1, max_iterations + 1):
+        _emit(progress, f"条件到达时间迭代 {iteration}/{max_iterations}……")
+        _emit(progress, f"比对 {len(profile.get('pacing_strategy', {}).get('samples', []))} 条历史活动的路线策略……")
+        route_pacing_match = match_route_pacing_strategy(profile, segments, estimate_hours, route_strategy_matching_mode)
+        _emit(progress, f"历史策略匹配完成，按动态到达时间计算 {len(segments)} 个自然地形段的条件……")
+        adjusted_rows, adjusted_seconds, _ = _predict_once(
+            profile, segments, estimate_hours, race_condition, route_pacing_match, apply_environment=True
         )
-        updated_hours = standard_seconds / 3600.0
-        if abs(updated_hours - estimate_hours) * 3600.0 <= float(duration_config["convergence_tolerance_seconds"]):
+        updated_hours = adjusted_seconds / 3600.0
+        if abs(updated_hours - estimate_hours) * 3600.0 <= tolerance_seconds:
             converged = True
             estimate_hours = updated_hours
             break
         estimate_hours = updated_hours
 
-    route_pacing_match = match_route_pacing_strategy(profile, segments, estimate_hours)
+    _emit(progress, "汇总收敛后的逐段预测与标准能力时间……")
+    route_pacing_match = match_route_pacing_strategy(profile, segments, estimate_hours, route_strategy_matching_mode)
     standard_rows, standard_seconds, _ = _predict_once(
         profile, segments, estimate_hours, RaceCondition(), route_pacing_match, apply_environment=False
     )
@@ -70,12 +83,33 @@ def predict_race(
     aid_seconds = race_condition.aid_station_minutes * 60.0
     confidence_details = _prediction_confidence_details(profile, adjusted_rows, gpx_quality_score)
     confidence = float(confidence_details["overall"])
+    _emit(progress, "执行 Monte Carlo 概率模拟……")
     probability = simulate_segmented_finish_times(
-        profile, adjusted_rows, aid_seconds, gpx_quality_score, simulations, seed
+        profile, adjusted_rows, aid_seconds, gpx_quality_score, simulations, seed,
+        route_pacing_match.get("uncertainty"), condition=race_condition,
+        estimated_hours=estimate_hours, progress=progress,
     )
     probability.setdefault("uncertainty", {})["route_weighted_confidence"] = confidence_details
+    probability, prediction_calibration = calibrate_prediction_interval(
+        probability,
+        profile.get("prediction_calibration") if isinstance(profile.get("prediction_calibration"), dict) else None,
+        dict(route_pacing_match.get("target", {})),
+        dict(probability.get("uncertainty", {}).get("terrain_time_share", {})),
+        {
+            "route_uncertainty": route_pacing_match.get("uncertainty", {}),
+            "terrain_time_share": probability.get("uncertainty", {}).get("terrain_time_share", {}),
+            "fatigue_extrapolated": _fatigue_extrapolated(profile, adjusted_rows),
+            "dynamic_environment": probability.get("uncertainty", {}).get("dynamic_environment", {}),
+        },
+    )
     risks = _risk_notes(profile, adjusted_rows, gpx_quality_score, converged)
+    risks.extend(str(note) for note in route_pacing_match.get("uncertainty", {}).get("reasons", []) if note not in risks)
+    if prediction_calibration.get("enabled"):
+        risks.append("最终概率区间已使用严格无泄漏历史回测校准；详细样本门槛和修正幅度见校准说明。")
     environment_summary = _environment_summary(profile, adjusted_rows)
+    environment_summary["arrival_time_mode"] = "condition_adjusted_iterative"
+    environment_summary["arrival_time_converged"] = converged
+    environment_summary["arrival_time_iterations"] = iteration
 
     payload = {
         "schema_version": "0.3",
@@ -89,10 +123,13 @@ def predict_race(
         "conservative_time_seconds": probability["p90_seconds"],
         "confidence": round(confidence, 3),
         "duration_match": {"estimated_hours": round(estimate_hours, 3), "converged": converged,
-                           "iterations": iteration, "terrain": {terrain: duration_match(profile, estimate_hours, terrain) for terrain in ("flat", "uphill", "downhill")}},
+                           "iterations": iteration, "mode": "condition_adjusted_arrival_time",
+                           "convergence_tolerance_seconds": tolerance_seconds,
+                           "terrain": {terrain: duration_match(profile, estimate_hours, terrain) for terrain in ("flat", "uphill", "downhill")}},
         "pacing_strategy_match": route_pacing_match,
         "adjustment_breakdown": {**breakdown, "aid_station": round(aid_seconds, 1)},
         "probability": probability,
+        "calibration": prediction_calibration,
         "risk_notes": risks,
         "environment": environment_summary,
         "physiology": _physiology_summary(profile, race_condition, adjusted_rows),
@@ -103,6 +140,11 @@ def predict_race(
         "total_time_seconds": round(adjusted_seconds + aid_seconds, 1),
     }
     return PredictionResult.from_dict(payload).to_dict()
+
+
+def _emit(progress: Callable[[str], None] | None, message: str) -> None:
+    if progress is not None:
+        progress(message)
 
 
 def _predict_once(
@@ -246,6 +288,20 @@ def fatigue_factor(profile: dict[str, object], elapsed_hour: float, terrain: str
     if elapsed_hour <= 5.0:
         return float(fatigue["5h"])
     return float(fatigue["8h"])
+
+
+def _fatigue_extrapolated(profile: dict[str, object], rows: list[dict[str, object]]) -> bool:
+    """Whether this route reaches an explicitly extrapolated fatigue tail."""
+    estimated_hours = max((float(row.get("cumulative_time_seconds", 0.0)) / 3600.0 for row in rows), default=0.0)
+    for terrain in ("flat", "uphill", "downhill"):
+        points = [item for item in profile.get("fatigue", {}).get(terrain, []) if isinstance(item, dict)]
+        for point in points:
+            if str(point.get("source")) != "extrapolated":
+                continue
+            start = float(point.get("hour", estimated_hours)) - float(point.get("extrapolation_distance_hours", 0.0))
+            if estimated_hours > max(0.0, start):
+                return True
+    return False
 
 
 def save_prediction(prediction: dict[str, object], path: str | Path) -> None:

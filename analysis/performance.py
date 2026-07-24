@@ -25,8 +25,10 @@ def analyze_performance(
     target_name: str,
     sample_distance_m: float = 100.0,
     simulations: int = 3000,
+    seed: int | None = None,
     progress: Callable[[str], None] | None = None,
     profile: dict[str, object] | None = None,
+    route_strategy_matching_mode: str = "structural",
 ) -> dict[str, object]:
     """Compare one independent FIT activity with a profile built from baseline FITs."""
     if profile is None and not baseline_activities:
@@ -55,7 +57,9 @@ def analyze_performance(
         aid_minutes=0.0,
         condition=condition,
         simulations=simulations,
+        seed=seed,
         gpx_quality_score=float(route_quality["score"]),
+        route_strategy_matching_mode=route_strategy_matching_mode,
     )
     diagnosis = _compare_actual_with_prediction(
         target_activity,

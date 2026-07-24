@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,24 +117,9 @@ def test_diagnosis_snapshot_excludes_target_and_future_activities() -> None:
     assert str(profile["reference_time"]).startswith("2026-02-01")
 
 
-def test_legacy_runner_profile_is_read_only() -> None:
-    bundle = build_ability_bundle(
-        {"first.fit": activity("2026-01-01")},
-        {"first.fit": "trail"},
-        {"first.fit": "a" * 64},
-        reference_time=datetime(2026, 2, 1, tzinfo=timezone.utc),
-    )
-
-    legacy = load_ability_bundle(json.dumps(bundle.profile, ensure_ascii=False).encode("utf-8"))
-
-    assert legacy.legacy
-    assert not legacy.supports_update
-    with pytest.raises(ValueError, match="不能增量更新"):
-        update_ability_bundle(
-            legacy,
-            {"new.fit": activity("2026-02-02")},
-            {"new.fit": "trail"},
-        )
+def test_legacy_json_profile_is_rejected() -> None:
+    with pytest.raises(ValueError, match="仅支持新版 .ttp-profile"):
+        load_ability_bundle(b'{"schema_version":"0.3"}')
 
 
 def test_ability_file_config_tolerates_pre_v05_cached_config(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -1,10 +1,20 @@
 from __future__ import annotations
 
+from typing import Callable
 from typing import Any
 
 import numpy as np
 
+from analysis.environment import solar_elevation_degrees_vector
+from analysis.temperature import (
+    heart_rate_heat_fatigue_time_factor_vector,
+    humidity_time_factor_vector,
+    race_temperature_at_elapsed_vector,
+    temperature_fatigue_time_factor_vector,
+    temperature_time_factor_vector,
+)
 from config import load_config
+from models import RaceCondition
 
 
 TERRAINS = ("flat", "uphill", "downhill")
@@ -21,6 +31,10 @@ def simulate_segmented_finish_times(
     gpx_quality_score: float = 1.0,
     simulations: int | None = None,
     seed: int | None = None,
+    route_strategy_uncertainty: dict[str, object] | None = None,
+    condition: RaceCondition | None = None,
+    estimated_hours: float | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     """Simulate the race segment by segment with terrain-specific ability and fatigue uncertainty."""
     if not segment_rows:
@@ -40,18 +54,34 @@ def simulate_segmented_finish_times(
         segment_rows, count, rng, config, duration_scale
     )
     condition_latents = _condition_latents(count, rng, config)
-    condition_summary = _condition_uncertainty_summary(segment_rows, config)
+    race_condition = condition.normalized() if condition is not None else None
+    dynamic_source_modes = _dynamic_environment_source_modes(segment_rows, race_condition)
+    condition_summary = _condition_uncertainty_summary(segment_rows, config, dynamic_source_modes)
     gpx_sigma = _gpx_sigma(gpx_quality_score, config)
     gpx_shared = rng.normal(size=count)
     gpx_correlation = float(config.get("gpx_segment_correlation", 0.55))
+    route_uncertainty = dict(route_strategy_uncertainty or {})
+    route_global_sigma = max(0.0, float(route_uncertainty.get("additional_global_sigma", 0.0)))
+    route_global_noise = rng.lognormal(0.0, route_global_sigma, count)
+    route_terrain_sigma = {
+        terrain: max(0.0, float(dict(route_uncertainty.get("terrain_sigma", {})).get(terrain, 0.0)))
+        for terrain in TERRAINS
+    }
+    route_terrain_noise = {
+        terrain: rng.lognormal(0.0, route_terrain_sigma[terrain], count)
+        for terrain in TERRAINS
+    }
 
     elapsed = np.zeros(count, dtype=float)
     terrain_seconds = {terrain: 0.0 for terrain in TERRAINS}
     gpx_affected_seconds = 0.0
-    for row in segment_rows:
+    dynamic_night_seconds = np.zeros(count, dtype=float)
+    dynamic_temperature_seconds = np.zeros(count, dtype=float)
+    dynamic_temperature_weighted = np.zeros(count, dtype=float)
+    progress_interval = max(1, len(segment_rows) // 5)
+    for index, row in enumerate(segment_rows, start=1):
         terrain = str(row.get("type", "flat"))
         deterministic_duration = float(row.get("duration_factor", 1.0))
-        deterministic_condition = float(row.get("condition_factor", 1.0))
         raw_seconds, sampled_grade = _sample_gpx_geometry(
             profile, row, count, rng, gpx_shared, gpx_sigma, gpx_correlation
         )
@@ -68,23 +98,41 @@ def simulate_segmented_finish_times(
             fatigue_samples[terrain]["hours"],
             fatigue_samples[terrain]["values"],
         )
+        before_condition = sustainable / np.maximum(fatigue, 0.1)
+        dynamic_condition = _dynamic_condition_factors(
+            profile, row, race_condition, elapsed, before_condition,
+            float(estimated_hours if estimated_hours is not None else max(float(row.get("cumulative_time_seconds", 0.0)) / 3600.0, 0.01)),
+        )
         condition_uncertainty = _condition_noise_for_row(
-            row, terrain, condition_latents, config
+            row, terrain, condition_latents, config,
+            dynamic_factors=dynamic_condition["sources"], source_modes=dynamic_source_modes,
         )
         seconds = (
-            sustainable
-            / np.maximum(fatigue, 0.1)
-            * deterministic_condition
+            before_condition
+            * dynamic_condition["total"]
             * condition_uncertainty
+            * route_global_noise
+            * route_terrain_noise[terrain]
         )
         elapsed += seconds
+        dynamic_night_seconds += seconds * dynamic_condition["night_ratio"]
+        if dynamic_condition["temperature_c"] is not None:
+            dynamic_temperature_seconds += seconds
+            dynamic_temperature_weighted += seconds * dynamic_condition["temperature_c"]
         terrain_seconds[terrain] += float(row["predicted_time_seconds"])
         if terrain != "flat" and bool(row.get("elevation_available", True)):
             gpx_affected_seconds += float(row["predicted_time_seconds"])
+        if progress is not None and (index == len(segment_rows) or index % progress_interval == 0):
+            progress(f"Monte Carlo 概率模拟：已处理 {index}/{len(segment_rows)} 个自然地形段……")
 
     samples = np.maximum(elapsed + max(0.0, float(aid_seconds)), 1.0)
     p10, p50, p90 = np.percentile(samples, [10, 50, 90])
     total_deterministic = sum(terrain_seconds.values())
+    moving_samples = np.maximum(elapsed, 1.0)
+    dynamic_temperature = np.divide(
+        dynamic_temperature_weighted, dynamic_temperature_seconds,
+        out=np.full(count, np.nan), where=dynamic_temperature_seconds > 0,
+    )
     terrain_share = {
         terrain: round(terrain_seconds[terrain] / total_deterministic, 4) if total_deterministic > 0 else 0.0
         for terrain in TERRAINS
@@ -96,7 +144,7 @@ def simulate_segmented_finish_times(
         "simulations": count,
         "sigma": round(float(np.std(samples) / np.mean(samples)), 4),
         "samples_seconds": [round(float(value), 1) for value in samples],
-        "method": "segmented_source_condition_physical_gpx",
+        "method": "segmented_dynamic_environment_source_condition_physical_gpx",
         "uncertainty": {
             "terrain_time_share": terrain_share,
             "ability_confidence": ability_confidence,
@@ -111,6 +159,22 @@ def simulate_segmented_finish_times(
                 "vertical_sigma": round(gpx_sigma, 4),
                 "affected_time_share": round(gpx_affected_seconds / total_deterministic, 4)
                 if total_deterministic > 0 else 0.0,
+            },
+            "route_similarity": {
+                "additional_global_sigma": round(route_global_sigma, 4),
+                "terrain_sigma": {terrain: round(value, 4) for terrain, value in route_terrain_sigma.items()},
+                "reasons": list(route_uncertainty.get("reasons", [])),
+            },
+            "dynamic_environment": {
+                "mode": "per_simulation_elapsed_time",
+                "enabled": race_condition is not None,
+                "sources": dynamic_source_modes,
+                "mean_night_ratio": round(float(np.mean(dynamic_night_seconds / moving_samples)), 4),
+                "night_ratio_p10": round(float(np.percentile(dynamic_night_seconds / moving_samples, 10)), 4),
+                "night_ratio_p90": round(float(np.percentile(dynamic_night_seconds / moving_samples, 90)), 4),
+                "mean_temperature_c": None if np.isnan(dynamic_temperature).all() else round(float(np.nanmean(dynamic_temperature)), 2),
+                "temperature_c_p10": None if np.isnan(dynamic_temperature).all() else round(float(np.nanpercentile(dynamic_temperature, 10)), 2),
+                "temperature_c_p90": None if np.isnan(dynamic_temperature).all() else round(float(np.nanpercentile(dynamic_temperature, 90)), 2),
             },
         },
     }
@@ -249,9 +313,24 @@ def _condition_latents(
     count: int, rng: np.random.Generator, config: dict[str, Any]
 ) -> dict[str, dict[str, np.ndarray]]:
     correlation = max(0.0, min(1.0, float(config.get("condition_terrain_correlation", 0.85))))
+    dynamic = dict(load_config().get("dynamic_environment", {}))
+    grouped_correlation = dict(dynamic.get("correlation", {}))
+    group_sources = {
+        "weather_heat": {"weather", "temperature_fatigue", "heart_rate_fatigue"},
+        "technical_mud": {"technical", "mud"},
+    }
+    group_shared = {name: rng.normal(size=count) for name in group_sources}
     result: dict[str, dict[str, np.ndarray]] = {}
     for source in CONDITION_SOURCES:
-        shared = rng.normal(size=count)
+        group_name = next((name for name, sources in group_sources.items() if source in sources), None)
+        if group_name is None:
+            shared = rng.normal(size=count)
+        else:
+            source_correlation = max(0.0, min(1.0, float(grouped_correlation.get(group_name, 0.0))))
+            shared = (
+                np.sqrt(source_correlation) * group_shared[group_name]
+                + np.sqrt(1.0 - source_correlation) * rng.normal(size=count)
+            )
         independent = rng.normal(size=(len(TERRAINS), count))
         result[source] = {
             terrain: np.sqrt(correlation) * shared + np.sqrt(1.0 - correlation) * independent[index]
@@ -265,15 +344,20 @@ def _condition_noise_for_row(
     terrain: str,
     latents: dict[str, dict[str, np.ndarray]],
     config: dict[str, Any],
+    dynamic_factors: dict[str, float | np.ndarray] | None = None,
+    source_modes: dict[str, str] | None = None,
 ) -> np.ndarray:
     factors = dict(row.get("condition_factors", {}))
     confidences = dict(row.get("condition_confidence", {}))
     sample = np.ones_like(next(iter(latents.values()))[terrain])
     for source in CONDITION_SOURCES:
-        sigma = _condition_sigma_for_factor(
-            source, float(factors.get(source, 1.0)), config, float(confidences.get(source, 0.7))
+        factor = factors.get(source, 1.0) if dynamic_factors is None else dynamic_factors.get(source, factors.get(source, 1.0))
+        source_mode = "route_confirmed" if source_modes is None else source_modes.get(source, "route_confirmed")
+        sigma = _condition_sigma_for_factor_vector(
+            source, factor, config, float(confidences.get(source, 0.7)),
+            _source_uncertainty_scale(source, source_modes, config), source_mode,
         )
-        if sigma > 0:
+        if np.any(sigma > 0):
             sample *= np.exp(sigma * latents[source][terrain])
     return sample
 
@@ -289,8 +373,106 @@ def _condition_sigma_for_factor(
     return maximum * activation * confidence_scale
 
 
+def _condition_sigma_for_factor_vector(
+    source: str,
+    factor: float | np.ndarray,
+    config: dict[str, Any],
+    confidence: float = 0.7,
+    source_scale: float = 1.0,
+    source_mode: str = "route_confirmed",
+) -> np.ndarray:
+    source_sigmas = dict(config.get("condition_source_sigma", {}))
+    maximum = float(source_sigmas.get(source, config.get("condition_sigma", 0.02)))
+    reference = max(float(config.get("condition_activation_reference", 0.10)), 1e-6)
+    activation = np.minimum(np.abs(np.asarray(factor, dtype=float) - 1.0) / reference, 1.0)
+    if source_mode == "unknown":
+        unknown_prior = float(load_config().get("dynamic_environment", {}).get("uncertainty", {}).get("unknown_prior_activation", 0.0))
+        activation = np.maximum(activation, max(0.0, min(1.0, unknown_prior)))
+    confidence_scale = 1.25 - 0.5 * max(0.0, min(1.0, confidence))
+    return maximum * activation * confidence_scale * max(0.0, source_scale)
+
+
+def _source_uncertainty_scale(source: str, source_modes: dict[str, str] | None, config: dict[str, Any]) -> float:
+    mode = "route_confirmed" if source_modes is None else source_modes.get(source, "route_confirmed")
+    settings = dict(load_config().get("dynamic_environment", {}).get("uncertainty", {}))
+    return float(settings.get(f"{mode}_sigma_scale", 1.0))
+
+
+def _dynamic_environment_source_modes(
+    rows: list[dict[str, object]], condition: RaceCondition | None
+) -> dict[str, str]:
+    has_route_clock = bool(
+        condition is not None and condition.race_start_time_utc is not None
+        and any("latitude" in row and "longitude" in row for row in rows)
+    )
+    has_temperature = bool(condition is not None and condition.temperature_c is not None)
+    modes = {source: "route_confirmed" for source in CONDITION_SOURCES}
+    modes.update({
+        "heart_rate_pacing": "user_input", "form": "user_input", "technical": "user_input",
+        "mud": "user_input", "carried_weight": "user_input",
+    })
+    modes["weather"] = "user_input" if has_temperature else "unknown"
+    modes["temperature_fatigue"] = modes["weather"]
+    modes["heart_rate_fatigue"] = modes["weather"]
+    modes["night"] = "route_confirmed" if has_route_clock else "unknown"
+    modes["altitude"] = "route_confirmed" if any(bool(row.get("elevation_available", False)) for row in rows) else "unknown"
+    return modes
+
+
+def _dynamic_condition_factors(
+    profile: dict[str, object],
+    row: dict[str, object],
+    condition: RaceCondition | None,
+    elapsed_seconds: np.ndarray,
+    before_condition_seconds: np.ndarray,
+    estimated_hours: float,
+) -> dict[str, object]:
+    """Re-evaluate time-dependent conditions for one simulated segment."""
+    stored = {name: float(value) for name, value in dict(row.get("condition_factors", {})).items()}
+    count = len(elapsed_seconds)
+    sources: dict[str, float | np.ndarray] = {
+        name: np.full(count, stored.get(name, 1.0), dtype=float)
+        for name in CONDITION_SOURCES
+    }
+    if condition is None:
+        total = np.ones(count, dtype=float)
+        for value in sources.values():
+            total *= value
+        return {"total": total, "sources": sources, "night_ratio": np.zeros(count), "temperature_c": None}
+
+    midpoint_hours = (elapsed_seconds + before_condition_seconds / 2.0) / 3600.0
+    temperatures = race_temperature_at_elapsed_vector(condition, midpoint_hours, estimated_hours)
+    if temperatures is not None:
+        sources["weather"] = temperature_time_factor_vector(profile, temperatures) * humidity_time_factor_vector(
+            temperatures, condition.humidity_percent
+        )
+        sources["temperature_fatigue"] = temperature_fatigue_time_factor_vector(profile, temperatures, midpoint_hours)
+        sources["heart_rate_fatigue"] = heart_rate_heat_fatigue_time_factor_vector(profile, temperatures, midpoint_hours)
+
+    night_ratio = np.full(count, float(dict(row.get("environment", {})).get("night_ratio", condition.night_running_ratio)), dtype=float)
+    if condition.race_start_time_utc is not None and "latitude" in row and "longitude" in row:
+        solar = solar_elevation_degrees_vector(
+            condition.race_start_time_utc, elapsed_seconds + before_condition_seconds / 2.0,
+            float(row["latitude"]), float(row["longitude"]),
+        )
+        night_ratio = (solar <= float(load_config()["environment"]["night_solar_elevation_degrees"])).astype(float)
+        terrain = str(row.get("type", "flat"))
+        historical_night = float(
+            profile.get("environment", {}).get("night", {}).get("terrain", {}).get(terrain, {}).get(
+                "ratio", profile.get("environment", {}).get("night", {}).get("ratio", 0.0)
+            )
+        )
+        night_penalty = float(load_config()["conditions"]["night_max"][terrain])
+        sources["night"] = (1.0 + night_ratio * night_penalty) / (1.0 + historical_night * night_penalty)
+
+    total = np.ones(count, dtype=float)
+    for value in sources.values():
+        total *= value
+    return {"total": total, "sources": sources, "night_ratio": night_ratio, "temperature_c": temperatures}
+
+
 def _condition_uncertainty_summary(
-    rows: list[dict[str, object]], config: dict[str, Any]
+    rows: list[dict[str, object]], config: dict[str, Any], source_modes: dict[str, str] | None = None,
 ) -> dict[str, dict[str, float]]:
     total = sum(float(row.get("predicted_time_seconds", 0.0)) for row in rows)
     summary: dict[str, dict[str, float]] = {}
@@ -302,6 +484,11 @@ def _condition_uncertainty_summary(
             factor = float(dict(row.get("condition_factors", {})).get(source, 1.0))
             confidence = float(dict(row.get("condition_confidence", {})).get(source, 0.7))
             sigma = _condition_sigma_for_factor(source, factor, config, confidence)
+            if source_modes is not None and source_modes.get(source) == "unknown":
+                maximum = float(dict(config.get("condition_source_sigma", {})).get(source, config.get("condition_sigma", 0.02)))
+                unknown_prior = float(load_config().get("dynamic_environment", {}).get("uncertainty", {}).get("unknown_prior_activation", 0.0))
+                source_scale = _source_uncertainty_scale(source, source_modes, config)
+                sigma = max(sigma, maximum * max(0.0, min(1.0, unknown_prior)) * (1.25 - 0.5 * max(0.0, min(1.0, confidence))) * source_scale)
             weighted_sigma += seconds * sigma
             if abs(factor - 1.0) > 1e-6:
                 active_seconds += seconds
@@ -328,19 +515,97 @@ def _sample_gpx_geometry(
     """Perturb vertical metres, then recalculate grade and terrain base time."""
     micro_segments = list(row.get("micro_segments", []))
     if micro_segments:
-        sampled_seconds = np.zeros(count, dtype=float)
-        weighted_grade = np.zeros(count, dtype=float)
-        total_distance = 0.0
-        for micro in micro_segments:
-            unit_seconds, unit_grade = _sample_gpx_geometry_unit(
-                profile, micro, count, rng, shared, sigma, correlation
-            )
-            distance = max(float(micro.get("distance", 0.0)), 0.0)
-            sampled_seconds += unit_seconds
-            weighted_grade += unit_grade * distance
-            total_distance += distance
-        return sampled_seconds, weighted_grade / max(total_distance, 0.1)
+        return _sample_gpx_micro_batch(profile, micro_segments, count, rng, shared, sigma, correlation)
     return _sample_gpx_geometry_unit(profile, row, count, rng, shared, sigma, correlation)
+
+
+def _sample_gpx_micro_batch(
+    profile: dict[str, object],
+    micro_segments: list[dict[str, object]],
+    count: int,
+    rng: np.random.Generator,
+    shared: np.ndarray,
+    sigma: float,
+    correlation: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorise GPX perturbation within one natural terrain segment.
+
+    A long GPX has thousands of 25m micro-segments.  Sampling one vector per
+    micro-segment made the Python loop dominate a 3,000-run simulation.  The
+    batch remains bounded by one natural segment, so it avoids allocating an
+    entire-route matrix while retaining the original global/segment correlation
+    model.
+    """
+    total_seconds = np.zeros(count, dtype=float)
+    weighted_grade = np.zeros(count, dtype=float)
+    total_distance = 0.0
+    correlation = max(0.0, min(1.0, correlation))
+    shared_scale = np.sqrt(correlation)
+    independent_scale = np.sqrt(1.0 - correlation)
+
+    for terrain in TERRAINS:
+        selected = [
+            micro for micro in micro_segments
+            if str(micro.get("type", "flat")) == terrain and bool(micro.get("elevation_available", True))
+        ]
+        if not selected:
+            continue
+        distances = np.asarray([max(float(micro.get("distance", 0.0)), 0.1) for micro in selected])
+        grades = np.asarray([float(micro.get("grade", 0.0)) for micro in selected])
+        total_distance += float(distances.sum())
+        if terrain == "flat":
+            total_seconds += float(distances.sum()) / 1000.0 * float(profile["flat"]["aerobic_pace"])
+            weighted_grade += float(np.dot(grades, distances))
+            continue
+
+        z = shared_scale * shared[None, :] + independent_scale * rng.normal(size=(len(selected), count))
+        if terrain == "uphill":
+            vertical = np.asarray([
+                max(float(micro.get("gain", 0.0)), distance * max(grade, 0.0) / 100.0, 0.1)
+                for micro, distance, grade in zip(selected, distances, grades)
+            ])
+            sampled_vertical = vertical[:, None] * np.exp(sigma * z)
+            sampled_grade = sampled_vertical / distances[:, None] * 100.0
+            curve = list(profile.get("uphill", {}).get("curve", []))
+            if curve:
+                curve_grades = np.asarray([float(point["grade"]) for point in curve])
+                curve_values = np.asarray([float(point["value"]) for point in curve])
+                vam = np.interp(sampled_grade, curve_grades, curve_values)
+                climbing = sampled_vertical / np.maximum(vam, 1.0) * 3600.0
+                flat_floor = distances[:, None] / 1000.0 * float(profile["flat"]["aerobic_pace"])
+                total_seconds += np.maximum(climbing, flat_floor).sum(axis=0)
+            else:
+                total_seconds += np.asarray([
+                    _geometry_seconds(profile, micro) for micro in selected
+                ]).sum()
+            weighted_grade += (sampled_grade * distances[:, None]).sum(axis=0)
+            continue
+
+        vertical = np.asarray([
+            max(float(micro.get("loss", 0.0)), distance * max(-grade, 0.0) / 100.0, 0.1)
+            for micro, distance, grade in zip(selected, distances, grades)
+        ])
+        sampled_vertical = vertical[:, None] * np.exp(sigma * z)
+        sampled_grade = -sampled_vertical / distances[:, None] * 100.0
+        curve = list(profile.get("downhill", {}).get("curve", []))
+        if curve:
+            curve_grades = np.asarray([float(point["grade"]) for point in curve])
+            curve_speeds = np.asarray([float(point["speed_mps"]) for point in curve])
+            order = np.argsort(curve_grades)
+            speed = np.interp(sampled_grade, curve_grades[order], curve_speeds[order])
+            total_seconds += (distances[:, None] / np.maximum(speed, 0.1)).sum(axis=0)
+        else:
+            total_seconds += np.asarray([_geometry_seconds(profile, micro) for micro in selected]).sum()
+        weighted_grade += (sampled_grade * distances[:, None]).sum(axis=0)
+
+    unavailable = [micro for micro in micro_segments if not bool(micro.get("elevation_available", True))]
+    if unavailable:
+        distances = np.asarray([max(float(micro.get("distance", 0.0)), 0.1) for micro in unavailable])
+        grades = np.asarray([float(micro.get("grade", 0.0)) for micro in unavailable])
+        total_distance += float(distances.sum())
+        total_seconds += np.asarray([_geometry_seconds(profile, micro) for micro in unavailable]).sum()
+        weighted_grade += float(np.dot(grades, distances))
+    return total_seconds, weighted_grade / max(total_distance, 0.1)
 
 
 def _sample_gpx_geometry_unit(
